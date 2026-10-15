@@ -34,6 +34,7 @@ type RenderConfig struct {
 	IsolatedBrowser bool
 	WindowWidth     int
 	WindowHeight    int
+	Actions         []chromedp.Action[chromedp.Void]
 }
 
 // RenderOption configures the JavaScript rendering process.
@@ -87,6 +88,80 @@ func BlockAssets(block bool) RenderOption {
 func RenderProxy(proxyURL string) RenderOption {
 	return func(rc *RenderConfig) {
 		rc.ProxyURL = proxyURL
+	}
+}
+
+// Click queues a click action on the element matching the CSS selector.
+func Click(selector string) RenderOption {
+	return func(rc *RenderConfig) {
+		rc.Actions = append(rc.Actions,
+			chromedp.WaitVisible(selector),
+			chromedp.Click(selector),
+		)
+	}
+}
+
+// TypeText types the specified text into the input element matching the CSS selector.
+func TypeText(selector, text string) RenderOption {
+	return func(rc *RenderConfig) {
+		rc.Actions = append(rc.Actions,
+			chromedp.WaitVisible(selector),
+			chromedp.SendKeys(selector, text),
+		)
+	}
+}
+
+// ScrollToBottom scrolls down the page in step increments with delays to trigger lazy-loaded images and infinite scrolling.
+func ScrollToBottom(stepPx int, stepDelay time.Duration) RenderOption {
+	if stepPx <= 0 {
+		stepPx = 600
+	}
+	if stepDelay <= 0 {
+		stepDelay = 200 * time.Millisecond
+	}
+	return func(rc *RenderConfig) {
+		rc.Actions = append(rc.Actions, chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+			script := fmt.Sprintf(`
+				new Promise((resolve) => {
+					let totalHeight = 0;
+					let distance = %d;
+					let timer = setInterval(() => {
+						let scrollHeight = document.body.scrollHeight;
+						window.scrollBy(0, distance);
+						totalHeight += distance;
+						if (totalHeight >= scrollHeight) {
+							clearInterval(timer);
+							resolve();
+						}
+					}, %d);
+				})
+			`, stepPx, stepDelay.Milliseconds())
+			_, err := chromedp.Evaluate[any](script, chromedp.EvalAwaitPromise)(ctx, t)
+			return err
+		}))
+	}
+}
+
+// EvaluateScript executes custom JavaScript in the browser context before capturing the rendered DOM.
+func EvaluateScript(js string) RenderOption {
+	return func(rc *RenderConfig) {
+		rc.Actions = append(rc.Actions, chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+			_, err := chromedp.Evaluate[any](js)(ctx, t)
+			return err
+		}))
+	}
+}
+
+// Screenshot captures a full page screenshot and writes it to the specified file path.
+func Screenshot(outputPath string) RenderOption {
+	return func(rc *RenderConfig) {
+		rc.Actions = append(rc.Actions, chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+			buf, err := chromedp.FullScreenshot(90)(ctx, t)
+			if err != nil {
+				return fmt.Errorf("failed to take screenshot: %w", err)
+			}
+			return os.WriteFile(outputPath, buf, 0644)
+		}))
 	}
 }
 
@@ -352,12 +427,12 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 	// Apply DOM wait conditions
 	var waitTasks []chromedp.Action[chromedp.Void]
 	if rc.WaitForSelector != "" {
-		waitTasks = append(waitTasks, chromedp.WaitVisible(chromedp.CSS(rc.WaitForSelector)))
+		waitTasks = append(waitTasks, chromedp.WaitVisible(rc.WaitForSelector))
 	} else if rc.WaitDuration > 0 {
 		waitTasks = append(waitTasks, chromedp.Sleep(rc.WaitDuration))
 	} else {
 		// Default: wait for document body ready
-		waitTasks = append(waitTasks, chromedp.WaitReady(chromedp.CSS("body")))
+		waitTasks = append(waitTasks, chromedp.WaitReady("body"))
 	}
 
 	if err := chromedp.Do(taskCtx, waitTasks...); err != nil {
@@ -368,8 +443,19 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		return nil, renderErr
 	}
 
+	// Execute interactive user action chains (clicks, typing, scroll, custom scripts, screenshots)
+	if len(rc.Actions) > 0 {
+		if err := chromedp.Do(taskCtx, rc.Actions...); err != nil {
+			renderErr := fmt.Errorf("chromedp action chain failed for %s: %w", targetURL, err)
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, renderErr, 1)
+			}
+			return nil, renderErr
+		}
+	}
+
 	// Extract the live, hydrated, modified DOM HTML
-	renderedHTML, err := chromedp.Run(taskCtx, chromedp.OuterHTML(chromedp.CSS("html")))
+	renderedHTML, err := chromedp.Run(taskCtx, chromedp.OuterHTML("html"))
 	if err != nil {
 		renderErr := fmt.Errorf("chromedp failed to retrieve outer HTML for %s: %w", targetURL, err)
 		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {

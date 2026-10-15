@@ -54,6 +54,18 @@ func main() {
 			Description:     "Live real estate portal protected by HUMAN Security (px-captcha)",
 		},
 		{
+			Name:            "Google reCAPTCHA Standalone Demo Page",
+			URL:             "https://www.google.com/recaptcha/api2/demo",
+			ExpectedVendors: "reCAPTCHA (Scope: full_page_wall)",
+			Description:     "Standalone Google verification demo page (widget is the only content on page)",
+		},
+		{
+			Name:            "hCaptcha Standalone Demo Page",
+			URL:             "https://accounts.hcaptcha.com/demo",
+			ExpectedVendors: "hCaptcha (Scope: full_page_wall)",
+			Description:     "Standalone hCaptcha verification demo page (widget is the only content on page)",
+		},
+		{
 			Name:            "Incolumitas Bot Analyzer (Clean Reference)",
 			URL:             "https://bot.incolumitas.com",
 			ExpectedVendors: "None (Clean Page)",
@@ -98,6 +110,8 @@ func main() {
 		fmt.Printf("      Is Blocked:      %t\n", blocked)
 		fmt.Printf("      Detected Vendor: %s\n", ab.Provider)
 		fmt.Printf("      Challenge Type:  %s\n", ab.ChallengeType)
+		fmt.Printf("      Scope:           %s\n", ab.Scope)
+		fmt.Printf("      Is Gatekeeper:   %t\n", ab.IsGatekeeper)
 		fmt.Printf("      Action Hint:     %s\n", ab.ActionHint)
 		if ab.IncidentID != "" {
 			fmt.Printf("      Incident/Ref ID: %s\n", ab.IncidentID)

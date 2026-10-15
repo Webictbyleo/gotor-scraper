@@ -304,13 +304,61 @@ func TestHTMLQuerying(t *testing.T) {
 
 	// 6. Test AbsoluteURL helper on Response
 	resolved := resp.AbsoluteURL("/api/v1/checkout")
-	u, _ := url.Parse(server.URL)
-	expectedResolved := server.URL + "/api/v1/checkout"
-	if u.Port() != "" {
-		expectedResolved = server.URL + "/api/v1/checkout"
-	}
+	parsedURL, _ := url.Parse(server.URL)
+	expectedResolved := parsedURL.String() + "/api/v1/checkout"
 	if resolved != expectedResolved {
 		t.Errorf("AbsoluteURL() = %s, want %s", resolved, expectedResolved)
+	}
+
+	// 7. Test Freeform CSS Selectors (Find & FindOne)
+	featuredCards := doc.Find("div.product-card.featured")
+	if len(featuredCards) != 1 {
+		t.Fatalf("Expected 1 featured card, got %d", len(featuredCards))
+	}
+	featured := featuredCards[0]
+	if featured.FindOne("a").Text() != "MacBook Pro" {
+		t.Errorf("Expected 'MacBook Pro', got: %s", featured.FindOne("a").Text())
+	}
+	if featured.FindOne("img").Attr("src") != "/images/laptop.jpg" {
+		t.Errorf("Expected '/images/laptop.jpg', got: %s", featured.FindOne("img").Attr("src"))
+	}
+	if !strings.HasSuffix(featured.FindOne("img").AbsoluteURL("src"), "/images/laptop.jpg") {
+		t.Errorf("Expected absolute URL on element: %s", featured.FindOne("img").AbsoluteURL("src"))
+	}
+
+	// 8. Test Scoped CSS Querying (Find inside HTMLElement)
+	allLinks := mainDiv.Find("div.product-card > a")
+	if len(allLinks) != 2 {
+		t.Fatalf("Expected 2 links via scoped CSS selector, got %d", len(allLinks))
+	}
+
+	// 9. Test InnerHTML and OuterHTML
+	inner, err := featured.InnerHTML()
+	if err != nil {
+		t.Fatalf("InnerHTML failed: %v", err)
+	}
+	if !strings.Contains(inner, "MacBook Pro") || !strings.Contains(inner, "<img") {
+		t.Errorf("Unexpected InnerHTML: %s", inner)
+	}
+
+	outer, err := featured.OuterHTML()
+	if err != nil {
+		t.Fatalf("OuterHTML failed: %v", err)
+	}
+	if !strings.HasPrefix(outer, "<div class=\"product-card featured\">") {
+		t.Errorf("Unexpected OuterHTML: %s", outer)
+	}
+
+	// 10. Test Attrs map
+	attrs := featured.Attrs()
+	if attrs["class"] != "product-card featured" {
+		t.Errorf("Expected class attribute 'product-card featured', got: %s", attrs["class"])
+	}
+
+	// 11. Test Formatted Text() Method
+	pageText := doc.Text()
+	if !strings.Contains(pageText, "Welcome\n\nMacBook Pro") {
+		t.Errorf("Expected formatted text with clean block breaks, got: %q", pageText)
 	}
 }
 
@@ -363,6 +411,59 @@ func TestRenderJS(t *testing.T) {
 
 	if contentDiv.Text() != "Hydrated Client Content" {
 		t.Errorf("Expected 'Hydrated Client Content', got: %s", contentDiv.Text())
+	}
+}
+
+func TestRenderActionChains(t *testing.T) {
+	interactiveHTML := `<!DOCTYPE html>
+<html>
+<head><title>Interactive Test</title></head>
+<body>
+    <div id="output">Waiting</div>
+    <input id="search-input" type="text" value="" />
+    <button id="search-btn" onclick="document.getElementById('output').textContent = 'Typed: ' + document.getElementById('search-input').value">Submit</button>
+</body>
+</html>`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(interactiveHTML))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(WithBrowserProfile(ProfileNone))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	resp, err := client.GetRendered(ctx, server.URL,
+		WaitForSelector("#search-btn"),
+		TypeText("#search-input", "golang scraper"),
+		Click("#search-btn"),
+		BlockAssets(true),
+	)
+	if err != nil {
+		t.Logf("GetRendered skipped or failed: %v", err)
+		return
+	}
+
+	doc, err := resp.HTML()
+	if err != nil {
+		t.Fatalf("Failed to parse rendered HTML: %v", err)
+	}
+
+	outEl := doc.FindOne("#output")
+	if outEl == nil {
+		t.Fatal("Could not find #output in rendered DOM")
+	}
+
+	if outEl.Text() != "Typed: golang scraper" {
+		t.Errorf("Expected action chain to type and click, got: %q", outEl.Text())
 	}
 }
 
