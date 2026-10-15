@@ -69,6 +69,9 @@ type ContentInfo struct {
 
 	// EmptyBody is true if the response payload has 0 bytes.
 	EmptyBody bool
+
+	// AntiBot contains the full verdict of the anti-bot and WAF challenge detector.
+	AntiBot *AntiBotDetection
 }
 
 // ContentFilter is a middleware function that evaluates ContentInfo before downloading the body.
@@ -120,6 +123,13 @@ func DetectContent(raw *http.Response, peeked []byte, urlPath string) *ContentIn
 	info.IsJSON = effectiveType == "application/json" || info.SniffedType == "application/json"
 	info.IsXML = effectiveType == "text/xml" || effectiveType == "application/xml" || strings.HasSuffix(effectiveType, "+xml")
 	info.IsBinary = isBinaryMediaType(effectiveType)
+
+	// Run deep anti-bot and WAF detection
+	info.AntiBot = DetectAntiBot(raw, peeked)
+	if info.AntiBot != nil && info.AntiBot.Detected {
+		info.MismatchDetected = true
+		info.MismatchReason = "Anti-bot challenge or block detected: " + info.AntiBot.Reason
+	}
 
 	// Detect mismatches (e.g. server claimed JSON/image but returned HTML challenge)
 	if info.MediaType != "" && info.SniffedType != "" {

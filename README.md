@@ -429,7 +429,44 @@ client, _ := torscraper.NewClient(
 
 ---
 
-### 13. Tor Control Port (Explicit IP Rotation)
+### 13. Comprehensive Anti-Bot & WAF Challenge Detection (`antibot.go`)
+
+Accurately detect whether a scrape was intercepted by bot defenses, challenge walls, or WAF IP bans—even when servers stealthily return **HTTP 200 OK** (e.g. Cloudflare Turnstile, Imperva Incapsula) or non-standard status codes (**AWS WAF 405/202**):
+
+* **Multi-Factor Correlation**: Prevents false positives by distinguishing genuine security gates from normal tech articles mentioning "Cloudflare" or "reCAPTCHA".
+* **Vendor Signatures Covered**:
+  - **Cloudflare**: `cf-mitigated: challenge`, Turnstile DOM (`challenges.cloudflare.com/turnstile`), Error 1020, Error 1015, and RayID extraction.
+  - **DataDome**: `x-datadome` headers, `datadome` cookie, `captcha-delivery.com`, and API 403 JSON payloads.
+  - **Akamai Bot Manager**: `AkamaiGHost`, `akamai-bot-decision`, and `Reference #18...` parsing.
+  - **PerimeterX / HUMAN Security**: `<div id="px-captcha">`, `window._pxAppId`, and Advanced Blocking Response (ABR) JSON.
+  - **Imperva / Incapsula**: Incident block iframes (`/_Incapsula_Resource`), `X-Iinfo`, and incident ID parsing (even on HTTP 200).
+  - **Kasada**: `x-kpsdk-*` headers and `/ips.js` bytecode VM Proof-of-Work telemetry.
+  - **AWS WAF**: `x-amzn-waf-action: captcha` (HTTP 405) and `challenge` (HTTP 202).
+  - **F5 BIG-IP ASM / Shape**: URL rejection notices and 19-digit Support ID extraction.
+  - **Standalone Captchas**: Google reCAPTCHA, hCaptcha, GeeTest, Arkose Labs (FunCaptcha).
+  - **Volumetric Rate Limits**: HTTP 429 with `Retry-After` header extraction.
+
+```go
+resp, err := client.Get(ctx, "https://target-site.com")
+if err != nil {
+    panic(err)
+}
+
+// 1. Quick boolean check
+if resp.IsBlocked() {
+    // 2. Detailed anti-bot telemetry
+    detection := resp.AntiBot()
+    fmt.Println("Blocked By Provider:", detection.Provider)         // e.g. "cloudflare", "datadome"
+    fmt.Println("Challenge Type:", detection.ChallengeType)        // e.g. "js_challenge", "interactive", "access_denied"
+    fmt.Println("Incident / Ray ID:", detection.IncidentID)        // e.g. "89abcdef01234567"
+    fmt.Println("Action Hint:", detection.ActionHint)              // e.g. "rotate_proxy", "use_headless", "sleep_backoff"
+    fmt.Println("Reason:", detection.Reason)
+}
+```
+
+---
+
+### 14. Tor Control Port (Explicit IP Rotation)
 
 If you have Tor's control port enabled (default `127.0.0.1:9051`) and want to explicitly trigger a circuit reset:
 
