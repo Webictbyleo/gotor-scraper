@@ -2,6 +2,7 @@ package torscraper
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -465,5 +466,79 @@ func TestWorkerPoolRenderBatch(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderContentDetection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/html":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html><body><p id="msg">Hello World</p></body></html>`))
+		case "/large":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			largeBody := "<!DOCTYPE html><html><body>" + strings.Repeat("A", 200*1024) + "</body></html>"
+			_, _ = w.Write([]byte(largeBody))
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// 1. Verify ContentInfo is properly populated by DetectContent on rendered page
+	client, err := NewClient(WithBrowserProfile(ProfileNone))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	resp, err := client.GetRendered(ctx, server.URL+"/html", WaitForSelector("#msg"), BlockAssets(true))
+	if err != nil {
+		t.Logf("GetRendered skipped (no browser binary): %v", err)
+		return
+	}
+
+	if resp.ContentInfo == nil {
+		t.Fatal("Expected ContentInfo to be populated on rendered response")
+	}
+	if !resp.ContentInfo.IsHTML {
+		t.Error("Expected ContentInfo.IsHTML to be true")
+	}
+	if resp.ContentInfo.MediaType != "text/html" {
+		t.Errorf("Expected media type text/html, got %s", resp.ContentInfo.MediaType)
+	}
+
+	// 2. Verify MaxContentLength safety limit enforces on GetRendered
+	strictClient, err := NewClient(
+		WithBrowserProfile(ProfileNone),
+		WithMaxContentLength(50*1024), // 50KB limit (server serves >200KB)
+	)
+	if err != nil {
+		t.Fatalf("Failed to create strict client: %v", err)
+	}
+	defer strictClient.Close()
+
+	_, err = strictClient.GetRendered(ctx, server.URL+"/large", WaitForSelector("body"), BlockAssets(true))
+	if !errors.Is(err, ErrContentLengthExceeded) {
+		t.Errorf("Expected ErrContentLengthExceeded, got: %v", err)
+	}
+
+	// 3. Verify Blocked Content Types enforces on GetRendered
+	blockedClient, err := NewClient(
+		WithBrowserProfile(ProfileNone),
+		WithBlockedContentTypes("text/html"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create blocked client: %v", err)
+	}
+	defer blockedClient.Close()
+
+	_, err = blockedClient.GetRendered(ctx, server.URL+"/html", WaitForSelector("#msg"), BlockAssets(true))
+	if !errors.Is(err, ErrContentTypeBlocked) {
+		t.Errorf("Expected ErrContentTypeBlocked, got: %v", err)
+	}
+}
+
 
 

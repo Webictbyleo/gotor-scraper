@@ -298,22 +298,70 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		}
 	}
 
-	// Navigate to target URL
-	tasks = append(tasks, chromedp.Navigate(targetURL))
-
-	// Apply DOM wait conditions
-	if rc.WaitForSelector != "" {
-		tasks = append(tasks, chromedp.WaitVisible(chromedp.CSS(rc.WaitForSelector)))
-	} else if rc.WaitDuration > 0 {
-		tasks = append(tasks, chromedp.Sleep(rc.WaitDuration))
-	} else {
-		// Default: wait for document body ready
-		tasks = append(tasks, chromedp.WaitReady(chromedp.CSS("body")))
+	// Execute initial network and cookie setup
+	if err := chromedp.Do(taskCtx, tasks...); err != nil {
+		renderErr := fmt.Errorf("chromedp network setup failed for %s: %w", targetURL, err)
+		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+			c.cfg.hooks.OnError(req, renderErr, 1)
+		}
+		return nil, renderErr
 	}
 
-	// Execute setup, navigation, and wait actions inside browser tab
-	if err := chromedp.Do(taskCtx, tasks...); err != nil {
-		renderErr := fmt.Errorf("chromedp rendering failed for %s: %w", targetURL, err)
+	// Navigate to target URL and capture actual HTTP response metadata from Chrome
+	navResp, err := chromedp.Run(taskCtx, chromedp.NavigateResponse(targetURL))
+	if err != nil {
+		// Fallback to standard Navigate if NavigateResponse encounters non-standard scheme
+		if navErr := chromedp.Do(taskCtx, chromedp.Navigate(targetURL)); navErr != nil {
+			renderErr := fmt.Errorf("chromedp navigation failed for %s: %w", targetURL, err)
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, renderErr, 1)
+			}
+			return nil, renderErr
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Stage 1 Content Check: Zero-Byte MIME Preflight Check
+	// -------------------------------------------------------------------------
+	if navResp != nil && navResp.MimeType != "" {
+		for _, pattern := range c.cfg.blockedContentTypes {
+			if MatchesContentType(navResp.MimeType, pattern) {
+				if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+					c.cfg.hooks.OnError(req, ErrContentTypeBlocked, 1)
+				}
+				return nil, ErrContentTypeBlocked
+			}
+		}
+		if len(c.cfg.allowedContentTypes) > 0 {
+			matched := false
+			for _, pattern := range c.cfg.allowedContentTypes {
+				if MatchesContentType(navResp.MimeType, pattern) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+					c.cfg.hooks.OnError(req, ErrContentTypeNotAllowed, 1)
+				}
+				return nil, ErrContentTypeNotAllowed
+			}
+		}
+	}
+
+	// Apply DOM wait conditions
+	var waitTasks []chromedp.Action[chromedp.Void]
+	if rc.WaitForSelector != "" {
+		waitTasks = append(waitTasks, chromedp.WaitVisible(chromedp.CSS(rc.WaitForSelector)))
+	} else if rc.WaitDuration > 0 {
+		waitTasks = append(waitTasks, chromedp.Sleep(rc.WaitDuration))
+	} else {
+		// Default: wait for document body ready
+		waitTasks = append(waitTasks, chromedp.WaitReady(chromedp.CSS("body")))
+	}
+
+	if err := chromedp.Do(taskCtx, waitTasks...); err != nil {
+		renderErr := fmt.Errorf("chromedp wait condition failed for %s: %w", targetURL, err)
 		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
 			c.cfg.hooks.OnError(req, renderErr, 1)
 		}
@@ -330,31 +378,109 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		return nil, renderErr
 	}
 
-	// Wrap in standard Response structure
-	rawHeader := make(http.Header)
-	rawHeader.Set("Content-Type", "text/html; charset=utf-8")
+	bodyBytes := []byte(renderedHTML)
 
-	resp := &Response{
-		StatusCode:  http.StatusOK,
-		Status:      "200 OK",
-		Headers:     rawHeader,
-		RawResponse: &http.Response{
-			StatusCode: http.StatusOK,
-			Status:     "200 OK",
-			Header:     rawHeader,
-			Request: &http.Request{
-				URL: parsedURL,
-			},
-		},
-		rawBody: []byte(renderedHTML),
+	// -------------------------------------------------------------------------
+	// Stage 2 Content Check: Safety Size Limits & Magic-Byte Verification
+	// -------------------------------------------------------------------------
+	maxLimit := c.cfg.maxContentLength
+	if maxLimit <= 0 {
+		maxLimit = DefaultMaxContentLength
+	}
+	if maxLimit > 0 && int64(len(bodyBytes)) > maxLimit {
+		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+			c.cfg.hooks.OnError(req, ErrContentLengthExceeded, 1)
+		}
+		return nil, ErrContentLengthExceeded
 	}
 
-	resp.ContentInfo = &ContentInfo{
-		DeclaredType:  "text/html; charset=utf-8",
-		MediaType:     "text/html",
-		SniffedType:   "text/html",
-		ContentLength: int64(len(renderedHTML)),
-		IsHTML:        true,
+	// Reconstruct response headers and status from Chrome CDP response
+	rawHeader := make(http.Header)
+	statusCode := http.StatusOK
+	statusText := "200 OK"
+	finalURL := parsedURL
+
+	if navResp != nil {
+		if navResp.Status > 0 {
+			statusCode = int(navResp.Status)
+			statusText = fmt.Sprintf("%d %s", navResp.Status, navResp.StatusText)
+		}
+		if navResp.URL != "" {
+			if u, uErr := url.Parse(navResp.URL); uErr == nil {
+				finalURL = u
+			}
+		}
+		for k, v := range navResp.Headers {
+			if strVal, ok := v.(string); ok {
+				rawHeader.Set(k, strVal)
+			}
+		}
+	}
+	if rawHeader.Get("Content-Type") == "" {
+		rawHeader.Set("Content-Type", "text/html; charset=utf-8")
+	}
+
+	rawResp := &http.Response{
+		StatusCode: statusCode,
+		Status:     statusText,
+		Header:     rawHeader,
+		Request: &http.Request{
+			URL: finalURL,
+		},
+	}
+
+	// Run full magic-byte sniffing & semantic content classification on rendered HTML
+	urlPath := ""
+	if finalURL != nil {
+		urlPath = finalURL.Path
+	}
+	contentInfo := DetectContent(rawResp, bodyBytes, urlPath)
+
+	// Check blocked content types on post-rendered content
+	for _, pattern := range c.cfg.blockedContentTypes {
+		if MatchesContentType(contentInfo.MediaType, pattern) || (contentInfo.SniffedType != "" && MatchesContentType(contentInfo.SniffedType, pattern)) {
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, ErrContentTypeBlocked, 1)
+			}
+			return nil, ErrContentTypeBlocked
+		}
+	}
+
+	// Check allowed content types on post-rendered content
+	if len(c.cfg.allowedContentTypes) > 0 {
+		matched := false
+		for _, pattern := range c.cfg.allowedContentTypes {
+			if MatchesContentType(contentInfo.MediaType, pattern) || (contentInfo.SniffedType != "" && MatchesContentType(contentInfo.SniffedType, pattern)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, ErrContentTypeNotAllowed, 1)
+			}
+			return nil, ErrContentTypeNotAllowed
+		}
+	}
+
+	// Run custom ContentFilter middleware hook if defined
+	if c.cfg.contentFilter != nil {
+		if err := c.cfg.contentFilter(contentInfo, rawResp); err != nil {
+			filterErr := fmt.Errorf("%w: %v", ErrContentRejected, err)
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, filterErr, 1)
+			}
+			return nil, filterErr
+		}
+	}
+
+	resp := &Response{
+		StatusCode:  statusCode,
+		Status:      statusText,
+		Headers:     rawHeader,
+		RawResponse: rawResp,
+		ContentInfo: contentInfo,
+		rawBody:     bodyBytes,
 	}
 
 	// Fire OnResponse lifecycle hook
