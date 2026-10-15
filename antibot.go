@@ -203,6 +203,17 @@ var (
 // DetectAntiBot evaluates an HTTP response (headers, status code, and body) to identify
 // active bot defenses, WAF blocks, and interactive CAPTCHAs with multi-factor correlation.
 func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
+	res := detectAntiBotInner(raw, body)
+	if res != nil && res.Detected {
+		if res.Scope == "" {
+			res.Scope = ScopeFullPageWall
+			res.IsGatekeeper = true
+		}
+	}
+	return res
+}
+
+func detectAntiBotInner(raw *http.Response, body []byte) *AntiBotDetection {
 	if raw == nil {
 		return &AntiBotDetection{
 			Detected:      false,

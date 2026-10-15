@@ -2,6 +2,7 @@ package torscraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -133,17 +134,15 @@ func (p *WorkerPool) Process(ctx context.Context, jobs []Job) []*Result {
 		go func(workerID int) {
 			defer wg.Done()
 			for job := range jobChan {
-				select {
-				case <-ctx.Done():
+				if ctx.Err() != nil {
 					resultChan <- &Result{
 						Job:   job,
 						Error: ctx.Err(),
 					}
-					return
-				default:
-					res := p.executeJob(ctx, job)
-					resultChan <- res
+					continue
 				}
+				res := p.executeJob(ctx, job)
+				resultChan <- res
 			}
 		}(i)
 	}
@@ -221,13 +220,22 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 
 		// Check if we should retry
 		shouldRetry := false
-		if err != nil {
-			shouldRetry = true
-		} else if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
-			shouldRetry = true
+		if retries < p.config.MaxRetries {
+			if p.client.cfg.retryCondition != nil {
+				shouldRetry = p.client.cfg.retryCondition(resp, err)
+			} else {
+				if err != nil && !errors.Is(err, ErrContentLengthExceeded) && !errors.Is(err, ErrContentTypeBlocked) && !errors.Is(err, ErrContentTypeNotAllowed) && !errors.Is(err, ErrAntiBotBlocked) {
+					var blockedErr *BlockedError
+					if !errors.As(err, &blockedErr) {
+						shouldRetry = true
+					}
+				} else if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+					shouldRetry = true
+				}
+			}
 		}
 
-		if shouldRetry && retries < p.config.MaxRetries {
+		if shouldRetry {
 			retries++
 
 			// Trigger OnRetry lifecycle hook if configured

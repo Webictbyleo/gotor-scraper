@@ -220,12 +220,12 @@ func (c *Client) getOrCreateBrowser(ctx context.Context, rc *RenderConfig) (cont
 	c.browserMu.Lock()
 	defer c.browserMu.Unlock()
 
-	// If browser context is already active and healthy, reuse it
-	if c.browserCtx != nil && c.browserCtx.Err() == nil {
+	// If browser context is already active, healthy, and configured with the same proxy, reuse it
+	if c.browserCtx != nil && c.browserCtx.Err() == nil && c.browserProxy == rc.ProxyURL {
 		return c.browserCtx, nil
 	}
 
-	// Clean up any stale or dead context
+	// Clean up any stale or dead context (or browser with different proxy)
 	if c.browserCancel != nil {
 		c.browserCancel()
 	}
@@ -250,6 +250,7 @@ func (c *Client) getOrCreateBrowser(ctx context.Context, rc *RenderConfig) (cont
 	c.allocCancel = allocCancel
 	c.browserCtx = browserCtx
 	c.browserCancel = browserCancel
+	c.browserProxy = rc.ProxyURL
 
 	return c.browserCtx, nil
 }

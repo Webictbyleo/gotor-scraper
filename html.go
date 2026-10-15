@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/andybalholm/cascadia"
 	"golang.org/x/net/html"
 )
+
+var reHTMLComment = regexp.MustCompile(`(?s)<!--.*?-->`)
 
 // selectorCache caches compiled Cascadia CSS selectors for optimal query performance.
 var selectorCache sync.Map
@@ -84,23 +87,18 @@ func (el *HTMLElement) Node() *html.Node {
 	return el.node
 }
 
-// Title returns the page title (<title> text).
+// Title returns the page title (<title> text), properly formatted with entity decoding and clean text.
 func (doc *HTMLDocument) Title() string {
-	var title string
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && strings.ToLower(n.Data) == "title" {
-			if n.FirstChild != nil {
-				title = strings.TrimSpace(n.FirstChild.Data)
-			}
-			return
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
+	if doc == nil || doc.root == nil {
+		return ""
 	}
-	walk(doc.root)
-	return title
+	titleEl := doc.FindOne("title")
+	if titleEl != nil {
+		raw := titleEl.Text()
+		cleaned := reHTMLComment.ReplaceAllString(raw, "")
+		return strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
+	}
+	return ""
 }
 
 // Find evaluates a CSS selector across the entire document and returns all matching elements.

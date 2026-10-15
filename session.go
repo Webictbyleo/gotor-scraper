@@ -89,8 +89,11 @@ func (pj *PersistentCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 
 	pj.jar.SetCookies(u, cookies)
 
-	// Update registry for persistence
-	host := u.Host
+	// Update registry for persistence (use Hostname to strip non-standard port numbers)
+	host := u.Hostname()
+	if host == "" {
+		host = u.Host
+	}
 	if host != "" {
 		if pj.registry[host] == nil {
 			pj.registry[host] = make(map[string]*http.Cookie)
@@ -158,11 +161,22 @@ func (pj *PersistentCookieJar) saveLocked() error {
 	}
 
 	// Write atomically via temporary file
-	tmpFile := pj.filePath + ".tmp"
+	tmpFile := fmt.Sprintf("%s.%d.tmp", pj.filePath, time.Now().UnixNano())
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, pj.filePath)
+	defer func() {
+		_ = os.Remove(tmpFile)
+	}()
+
+	if err := os.Rename(tmpFile, pj.filePath); err != nil {
+		// On Windows, if destination exists or rename fails, remove destination and retry
+		_ = os.Remove(pj.filePath)
+		if err := os.Rename(tmpFile, pj.filePath); err != nil {
+			return os.WriteFile(pj.filePath, data, 0644)
+		}
+	}
+	return nil
 }
 
 // Load reads cookies from disk and populates the jar.
@@ -202,22 +216,22 @@ func (pj *PersistentCookieJar) Load() error {
 			cookiePath = "/"
 		}
 
-		// Inject for HTTP (needed for non-TLS test servers or unencrypted endpoints)
-		uHTTP := &url.URL{
-			Scheme: "http",
+		// Inject for HTTPS (all cookies including Secure cookies are valid over HTTPS)
+		uHTTPS := &url.URL{
+			Scheme: "https",
 			Host:   sc.Domain,
 			Path:   cookiePath,
 		}
-		pj.jar.SetCookies(uHTTP, []*http.Cookie{c})
+		pj.jar.SetCookies(uHTTPS, []*http.Cookie{c})
 
-		// Inject for HTTPS if not restricted to plain HTTP
+		// Inject for HTTP only if cookie is NOT restricted to HTTPS (RFC 6265)
 		if !sc.Secure {
-			uHTTPS := &url.URL{
-				Scheme: "https",
+			uHTTP := &url.URL{
+				Scheme: "http",
 				Host:   sc.Domain,
 				Path:   cookiePath,
 			}
-			pj.jar.SetCookies(uHTTPS, []*http.Cookie{c})
+			pj.jar.SetCookies(uHTTP, []*http.Cookie{c})
 		}
 
 		if pj.registry[sc.Domain] == nil {

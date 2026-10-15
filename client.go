@@ -26,6 +26,7 @@ type Client struct {
 	browserCtx    context.Context
 	browserCancel context.CancelFunc
 	allocCancel   context.CancelFunc
+	browserProxy  string
 }
 
 // NewClient creates a new Client configured with the provided options.
@@ -230,6 +231,7 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			trans := c.transport
 			if ro.torConfig != nil {
 				trans = NewCustomTransport(ro.torConfig, c.cfg.profile, c.cfg.insecureSkipVerify, c.cfg.timeout)
+				defer trans.CloseIdleConnections()
 			}
 			follow := c.cfg.followRedirects
 			if ro.followRedirects != nil {
@@ -259,12 +261,16 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 				c.cfg.hooks.OnError(req, err, attempt)
 			}
 		} else {
+			actualURLPath := req.URL.Path
+			if rawResp.Request != nil && rawResp.Request.URL != nil {
+				actualURLPath = rawResp.Request.URL.Path
+			}
 			respCfg := &responseConfig{
 				maxContentLength:    c.cfg.maxContentLength,
 				allowedContentTypes: c.cfg.allowedContentTypes,
 				blockedContentTypes: c.cfg.blockedContentTypes,
 				contentFilter:       c.cfg.contentFilter,
-				urlPath:             req.URL.Path,
+				urlPath:             actualURLPath,
 			}
 			if ro.maxContentLength != nil {
 				respCfg.maxContentLength = *ro.maxContentLength
@@ -397,6 +403,7 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 		WithSessionFile(cpyCfg.sessionFile),
 		WithSessionDir(cpyCfg.sessionDir, cpyCfg.sessionName),
 		WithAutoSaveSession(cpyCfg.autoSaveSession),
+		WithAbortOnAntiBot(cpyCfg.abortOnAntiBot),
 	}
 	if cpyCfg.hooks != nil {
 		optsList = append(optsList, WithHooks(*cpyCfg.hooks))
@@ -420,4 +427,5 @@ func (c *Client) Close() {
 		c.allocCancel = nil
 	}
 	c.browserCtx = nil
+	c.browserProxy = ""
 }
