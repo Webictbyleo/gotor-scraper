@@ -15,6 +15,10 @@ type clientConfig struct {
 	followRedirects    bool
 	maxRedirects       int
 	checkRedirect      func(req *http.Request, via []*http.Request) error
+	maxRetries         int
+	retryBackoff       time.Duration
+	rotateTorOnRetry   bool
+	retryCondition     func(resp *Response, err error) bool
 }
 
 func defaultClientConfig() *clientConfig {
@@ -26,6 +30,9 @@ func defaultClientConfig() *clientConfig {
 		insecureSkipVerify: false,
 		followRedirects:    true,
 		maxRedirects:       10,
+		maxRetries:         0,
+		retryBackoff:       500 * time.Millisecond,
+		rotateTorOnRetry:   true,
 	}
 }
 
@@ -139,16 +146,48 @@ func WithCheckRedirect(fn func(req *http.Request, via []*http.Request) error) Cl
 	}
 }
 
+// WithRetries sets the maximum retry attempts and initial backoff duration for failed requests.
+func WithRetries(maxRetries int, backoff time.Duration) ClientOption {
+	return func(c *clientConfig) {
+		c.maxRetries = maxRetries
+		if backoff > 0 {
+			c.retryBackoff = backoff
+		}
+	}
+}
+
+// WithRotateTorOnRetry toggles whether a new isolated Tor circuit is used when retrying.
+func WithRotateTorOnRetry(rotate bool) ClientOption {
+	return func(c *clientConfig) {
+		c.rotateTorOnRetry = rotate
+	}
+}
+
+// WithRetryCondition sets a custom predicate to decide if a request should be retried.
+func WithRetryCondition(fn func(resp *Response, err error) bool) ClientOption {
+	return func(c *clientConfig) {
+		c.retryCondition = fn
+	}
+}
+
 // requestOptions holds per-request overrides.
 type requestOptions struct {
 	torConfig       *TorConfig
 	headers         map[string]string
 	timeout         time.Duration
 	followRedirects *bool
+	maxRetries      *int
 }
 
 // RequestOption allows customizing an individual request.
 type RequestOption func(*requestOptions)
+
+// ReqWithRetries overrides the maximum retry attempts for an individual request.
+func ReqWithRetries(maxRetries int) RequestOption {
+	return func(ro *requestOptions) {
+		ro.maxRetries = &maxRetries
+	}
+}
 
 // ReqWithFollowRedirects overrides the redirect behavior for an individual request.
 func ReqWithFollowRedirects(follow bool) RequestOption {

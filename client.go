@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"time"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -138,22 +139,15 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 		req.Header.Set(k, v)
 	}
 
-	// Determine which client/transport to execute with
-	caller := c.httpCli
-	if ro.torConfig != nil || ro.followRedirects != nil {
-		trans := c.transport
-		if ro.torConfig != nil {
-			trans = NewCustomTransport(ro.torConfig, c.cfg.profile, c.cfg.insecureSkipVerify, c.cfg.timeout)
+	// Preserve body for potential retries
+	if req.Body != nil && req.GetBody == nil {
+		bodyBytes, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
 		}
-		follow := c.cfg.followRedirects
-		if ro.followRedirects != nil {
-			follow = *ro.followRedirects
-		}
-		caller = &http.Client{
-			Transport:     trans,
-			Jar:           c.cfg.cookieJar,
-			Timeout:       c.cfg.timeout,
-			CheckRedirect: buildCheckRedirect(follow, c.cfg.maxRedirects, c.cfg.checkRedirect),
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
 		}
 	}
 
@@ -164,12 +158,100 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 		req = req.WithContext(ctx)
 	}
 
-	rawResp, err := caller.Do(req)
-	if err != nil {
-		return nil, err
+	maxRetries := c.cfg.maxRetries
+	if ro.maxRetries != nil {
+		maxRetries = *ro.maxRetries
+	}
+	backoff := c.cfg.retryBackoff
+	if backoff <= 0 {
+		backoff = 500 * time.Millisecond
 	}
 
-	return newResponse(rawResp)
+	var lastResp *Response
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Rewind request body for retry
+			if req.GetBody != nil {
+				newBody, bErr := req.GetBody()
+				if bErr == nil {
+					req.Body = newBody
+				}
+			}
+
+			// If Tor rotation on retry is enabled and Tor is active, force a new circuit
+			if c.cfg.rotateTorOnRetry && ((c.cfg.torConfig != nil && c.cfg.torConfig.Enabled) || (ro.torConfig != nil && ro.torConfig.Enabled)) {
+				torBase := c.cfg.torConfig
+				if ro.torConfig != nil {
+					torBase = ro.torConfig
+				}
+				ro.torConfig = &TorConfig{
+					Enabled:         true,
+					ProxyAddr:       torBase.ProxyAddr,
+					StreamIsolation: true, // Forces new circuit
+				}
+			}
+		}
+
+		// Determine which client/transport to execute with
+		caller := c.httpCli
+		if ro.torConfig != nil || ro.followRedirects != nil {
+			trans := c.transport
+			if ro.torConfig != nil {
+				trans = NewCustomTransport(ro.torConfig, c.cfg.profile, c.cfg.insecureSkipVerify, c.cfg.timeout)
+			}
+			follow := c.cfg.followRedirects
+			if ro.followRedirects != nil {
+				follow = *ro.followRedirects
+			}
+			caller = &http.Client{
+				Transport:     trans,
+				Jar:           c.cfg.cookieJar,
+				Timeout:       c.cfg.timeout,
+				CheckRedirect: buildCheckRedirect(follow, c.cfg.maxRedirects, c.cfg.checkRedirect),
+			}
+		}
+
+		rawResp, err := caller.Do(req)
+		if err != nil {
+			lastErr = err
+			lastResp = nil
+		} else {
+			lastResp, lastErr = newResponse(rawResp)
+		}
+
+		// Check if we should retry
+		shouldRetry := false
+		if attempt < maxRetries {
+			if c.cfg.retryCondition != nil {
+				shouldRetry = c.cfg.retryCondition(lastResp, lastErr)
+			} else {
+				if lastErr != nil {
+					shouldRetry = true
+				} else if lastResp != nil && (lastResp.StatusCode == http.StatusTooManyRequests || lastResp.StatusCode >= 500) {
+					shouldRetry = true
+				}
+			}
+		}
+
+		if shouldRetry {
+			select {
+			case <-req.Context().Done():
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return lastResp, req.Context().Err()
+			case <-time.After(backoff):
+				backoff *= 2 // Exponential backoff
+				continue
+			}
+		}
+
+		break
+	}
+
+	return lastResp, lastErr
 }
 
 // Clone creates a new Client sharing the base settings, optionally modified with new options.
@@ -197,6 +279,9 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 		WithFollowRedirects(cpyCfg.followRedirects),
 		WithMaxRedirects(cpyCfg.maxRedirects),
 		WithCheckRedirect(cpyCfg.checkRedirect),
+		WithRetries(cpyCfg.maxRetries, cpyCfg.retryBackoff),
+		WithRotateTorOnRetry(cpyCfg.rotateTorOnRetry),
+		WithRetryCondition(cpyCfg.retryCondition),
 	)
 }
 

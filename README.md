@@ -177,7 +177,32 @@ fmt.Println("Final destination URL:", resp.FinalURL()) // e.g. https://target.co
 
 ---
 
-### 5. High-Concurrency Batch Scraping (Worker Pool)
+### 5. Automatic Retries & Tor Circuit Rotation
+
+The library provides exponential backoff retries for transient failures, network timeouts, HTTP 429 (Too Many Requests), and 5xx server errors. When Tor is active, it can automatically rotate to a fresh Tor circuit on every retry.
+
+#### Client Session Retries
+```go
+client, _ := torscraper.NewClient(
+    torscraper.WithRetries(3, 1 * time.Second), // Retry up to 3 times with 1s initial backoff (1s, 2s, 4s)
+    torscraper.WithRotateTorOnRetry(true),      // Forces a new Tor circuit on each retry!
+)
+
+// Automatically retries if the server returns 429/503 or drops the connection:
+resp, err := client.Get(ctx, "https://target-site.com/api")
+```
+
+#### Per-Request Retry Override
+```go
+// Override retry count on an individual request:
+resp, err := client.Get(ctx, "https://target-site.com/flaky",
+    torscraper.ReqWithRetries(5),
+)
+```
+
+---
+
+### 6. High-Concurrency Batch Scraping (Worker Pool)
 
 For scraping thousands of URLs in parallel with rate limits and retry resilience:
 

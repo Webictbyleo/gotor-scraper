@@ -260,3 +260,97 @@ func TestRedirects(t *testing.T) {
 		t.Errorf("Unexpected error message: %v", err)
 	}
 }
+
+func TestClientRetries(t *testing.T) {
+	var attempts int64
+	var postAttempts int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/retry-get":
+			cnt := atomic.AddInt64(&attempts, 1)
+			if cnt <= 2 {
+				http.Error(w, "server busy", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("success on attempt 3"))
+		case "/retry-post":
+			cnt := atomic.AddInt64(&postAttempts, 1)
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if cnt == 1 {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("posted: " + payload["data"]))
+		}
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// 1. Client with retries enabled
+	client, err := NewClient(
+		WithBrowserProfile(ProfileNone),
+		WithRetries(3, 10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	resp, err := client.Get(ctx, server.URL+"/retry-get")
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 OK after retries, got: %d", resp.StatusCode)
+	}
+	if resp.Text() != "success on attempt 3" {
+		t.Errorf("Unexpected body: %s", resp.Text())
+	}
+
+	// 2. Test POST payload rewinding across retry
+	postResp, err := client.PostJSON(ctx, server.URL+"/retry-post", map[string]string{"data": "test payload"})
+	if err != nil {
+		t.Fatalf("Post request failed: %v", err)
+	}
+	if postResp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 OK after retry, got: %d", postResp.StatusCode)
+	}
+	if postResp.Text() != "posted: test payload" {
+		t.Errorf("Unexpected post body: %s", postResp.Text())
+	}
+
+	// 3. Test per-request retry override
+	noRetryClient, err := NewClient(WithBrowserProfile(ProfileNone))
+	if err != nil {
+		t.Fatalf("Failed to create no-retry client: %v", err)
+	}
+	defer noRetryClient.Close()
+
+	// Without override, should return 503
+	atomic.StoreInt64(&attempts, 0)
+	failResp, err := noRetryClient.Get(ctx, server.URL+"/retry-get")
+	if err != nil {
+		t.Fatalf("Request returned error: %v", err)
+	}
+	if failResp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected 503 without retries, got: %d", failResp.StatusCode)
+	}
+
+	// With per-request override, should retry and succeed
+	atomic.StoreInt64(&attempts, 0)
+	overrideResp, err := noRetryClient.Get(ctx, server.URL+"/retry-get", ReqWithRetries(3))
+	if err != nil {
+		t.Fatalf("Override request failed: %v", err)
+	}
+	if overrideResp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 with per-request retries, got: %d", overrideResp.StatusCode)
+	}
+}
