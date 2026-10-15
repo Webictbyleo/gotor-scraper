@@ -202,7 +202,66 @@ resp, err := client.Get(ctx, "https://target-site.com/flaky",
 
 ---
 
-### 6. High-Concurrency Batch Scraping (Worker Pool)
+### 6. Content Detection Middleware & Safety Limits
+
+The library includes a **Two-Stage Content Detection Middleware** that intercepts responses **before** downloading the body. This prevents downloading huge files or unwanted media types over Tor and RAM:
+
+* **Stage 1 (Header Preflight)**: Aborts instantly if declared `Content-Length` exceeds limits or `Content-Type` is blocked. Zero body bytes are downloaded.
+* **Stage 2 (Magic-Byte Sniffing)**: Peeks the first 512 uncompressed bytes on-demand. Disambiguates WebP vs WAV vs AVI, AVIF vs MP4, JSON vs HTML, and detects Cloudflare CAPTCHAs disguised as APIs.
+
+#### Setting Max Body Size & Content Type Guards
+```go
+client, _ := torscraper.NewClient(
+    // Safety guard: max 5MB (default is 10MB; 0 for unlimited)
+    torscraper.WithMaxContentLength(5 * 1024 * 1024),
+
+    // Only allow HTML and JSON — drops PDFs, images, archives immediately
+    torscraper.WithAllowedContentTypes("text/html", "application/json"),
+
+    // Or explicitly block media/binary files
+    torscraper.WithBlockedContentTypes("image/*", "video/*", "application/zip", "application/pdf"),
+)
+
+resp, err := client.Get(ctx, "https://example.com/target")
+if errors.Is(err, torscraper.ErrContentLengthExceeded) {
+    fmt.Println("File was too large; aborted before downloading!")
+} else if errors.Is(err, torscraper.ErrContentTypeBlocked) {
+    fmt.Println("Content-Type was blocked; aborted before downloading!")
+}
+```
+
+#### Inspecting Verified Content Metadata
+Every response includes a rich `ContentInfo` struct:
+```go
+resp, _ := client.Get(ctx, "https://api.example.com/data")
+
+fmt.Println("Media Type:", resp.ContentInfo.MediaType)       // e.g. "application/json"
+fmt.Println("Sniffed Type:", resp.ContentInfo.SniffedType)   // Verified from magic bytes
+fmt.Println("Is JSON?:", resp.ContentInfo.IsJSON)           // true
+fmt.Println("Is HTML?:", resp.ContentInfo.IsHTML)           // false
+fmt.Println("Is Binary?:", resp.ContentInfo.IsBinary)       // false
+
+// Detect if server claimed JSON but actually returned a Cloudflare block page:
+if resp.ContentInfo.MismatchDetected {
+    fmt.Println("Warning: Server lied!", resp.ContentInfo.MismatchReason)
+}
+```
+
+#### Custom Pre-Download Middleware Hook
+```go
+client, _ := torscraper.NewClient(
+    torscraper.WithContentFilter(func(info *torscraper.ContentInfo, raw *http.Response) error {
+        if info.IsBinary {
+            return errors.New("binary files not allowed")
+        }
+        return nil // nil = proceed to download
+    }),
+)
+```
+
+---
+
+### 7. High-Concurrency Batch Scraping (Worker Pool)
 
 For scraping thousands of URLs in parallel with rate limits and retry resilience:
 

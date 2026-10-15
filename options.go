@@ -15,24 +15,31 @@ type clientConfig struct {
 	followRedirects    bool
 	maxRedirects       int
 	checkRedirect      func(req *http.Request, via []*http.Request) error
-	maxRetries         int
-	retryBackoff       time.Duration
-	rotateTorOnRetry   bool
-	retryCondition     func(resp *Response, err error) bool
+	maxRetries          int
+	retryBackoff        time.Duration
+	rotateTorOnRetry    bool
+	retryCondition      func(resp *Response, err error) bool
+	maxContentLength    int64
+	allowedContentTypes []string
+	blockedContentTypes []string
+	contentFilter       ContentFilter
 }
 
 func defaultClientConfig() *clientConfig {
 	return &clientConfig{
-		torConfig:          nil,
-		profile:            ProfileChrome, // Default to Chrome for modern web compatibility
-		timeout:            30 * time.Second,
-		defaultHeaders:     make(map[string]string),
-		insecureSkipVerify: false,
-		followRedirects:    true,
-		maxRedirects:       10,
-		maxRetries:         0,
-		retryBackoff:       500 * time.Millisecond,
-		rotateTorOnRetry:   true,
+		torConfig:           nil,
+		profile:             ProfileChrome, // Default to Chrome for modern web compatibility
+		timeout:             30 * time.Second,
+		defaultHeaders:      make(map[string]string),
+		insecureSkipVerify:  false,
+		followRedirects:     true,
+		maxRedirects:        10,
+		maxRetries:          0,
+		retryBackoff:        500 * time.Millisecond,
+		rotateTorOnRetry:    true,
+		maxContentLength:    DefaultMaxContentLength, // 10MB safety guard
+		allowedContentTypes: nil,
+		blockedContentTypes: nil,
 	}
 }
 
@@ -170,17 +177,80 @@ func WithRetryCondition(fn func(resp *Response, err error) bool) ClientOption {
 	}
 }
 
+// WithMaxContentLength sets the maximum response size limit in bytes (default: 10MB).
+// Set to 0 for unlimited.
+func WithMaxContentLength(maxBytes int64) ClientOption {
+	return func(c *clientConfig) {
+		c.maxContentLength = maxBytes
+	}
+}
+
+// WithAllowedContentTypes restricts responses to matching MIME types (e.g. "text/html", "application/json", "text/*").
+// Responses not matching are aborted before downloading.
+func WithAllowedContentTypes(types ...string) ClientOption {
+	return func(c *clientConfig) {
+		c.allowedContentTypes = append(c.allowedContentTypes, types...)
+	}
+}
+
+// WithBlockedContentTypes rejects responses matching any of the specified MIME patterns (e.g. "image/*", "video/*", "application/zip").
+// Responses matching are aborted before downloading.
+func WithBlockedContentTypes(types ...string) ClientOption {
+	return func(c *clientConfig) {
+		c.blockedContentTypes = append(c.blockedContentTypes, types...)
+	}
+}
+
+// WithContentFilter registers a middleware hook to inspect ContentInfo before the body is downloaded.
+func WithContentFilter(filter ContentFilter) ClientOption {
+	return func(c *clientConfig) {
+		c.contentFilter = filter
+	}
+}
+
 // requestOptions holds per-request overrides.
 type requestOptions struct {
-	torConfig       *TorConfig
-	headers         map[string]string
-	timeout         time.Duration
-	followRedirects *bool
-	maxRetries      *int
+	torConfig           *TorConfig
+	headers             map[string]string
+	timeout             time.Duration
+	followRedirects     *bool
+	maxRetries          *int
+	maxContentLength    *int64
+	allowedContentTypes []string
+	blockedContentTypes []string
+	contentFilter       ContentFilter
 }
 
 // RequestOption allows customizing an individual request.
 type RequestOption func(*requestOptions)
+
+// ReqWithMaxContentLength overrides the maximum content length limit for this request.
+func ReqWithMaxContentLength(maxBytes int64) RequestOption {
+	return func(ro *requestOptions) {
+		ro.maxContentLength = &maxBytes
+	}
+}
+
+// ReqWithAllowedContentTypes sets allowed MIME patterns for this request.
+func ReqWithAllowedContentTypes(types ...string) RequestOption {
+	return func(ro *requestOptions) {
+		ro.allowedContentTypes = append(ro.allowedContentTypes, types...)
+	}
+}
+
+// ReqWithBlockedContentTypes sets blocked MIME patterns for this request.
+func ReqWithBlockedContentTypes(types ...string) RequestOption {
+	return func(ro *requestOptions) {
+		ro.blockedContentTypes = append(ro.blockedContentTypes, types...)
+	}
+}
+
+// ReqWithContentFilter sets a custom content filter for this request.
+func ReqWithContentFilter(filter ContentFilter) RequestOption {
+	return func(ro *requestOptions) {
+		ro.contentFilter = filter
+	}
+}
 
 // ReqWithRetries overrides the maximum retry attempts for an individual request.
 func ReqWithRetries(maxRetries int) RequestOption {

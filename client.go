@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -218,7 +219,27 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			lastErr = err
 			lastResp = nil
 		} else {
-			lastResp, lastErr = newResponse(rawResp)
+			respCfg := &responseConfig{
+				maxContentLength:    c.cfg.maxContentLength,
+				allowedContentTypes: c.cfg.allowedContentTypes,
+				blockedContentTypes: c.cfg.blockedContentTypes,
+				contentFilter:       c.cfg.contentFilter,
+				urlPath:             req.URL.Path,
+			}
+			if ro.maxContentLength != nil {
+				respCfg.maxContentLength = *ro.maxContentLength
+			}
+			if len(ro.allowedContentTypes) > 0 {
+				respCfg.allowedContentTypes = append(respCfg.allowedContentTypes, ro.allowedContentTypes...)
+			}
+			if len(ro.blockedContentTypes) > 0 {
+				respCfg.blockedContentTypes = append(respCfg.blockedContentTypes, ro.blockedContentTypes...)
+			}
+			if ro.contentFilter != nil {
+				respCfg.contentFilter = ro.contentFilter
+			}
+
+			lastResp, lastErr = newResponse(rawResp, respCfg)
 		}
 
 		// Check if we should retry
@@ -227,7 +248,7 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			if c.cfg.retryCondition != nil {
 				shouldRetry = c.cfg.retryCondition(lastResp, lastErr)
 			} else {
-				if lastErr != nil {
+				if lastErr != nil && !errors.Is(lastErr, ErrContentLengthExceeded) && !errors.Is(lastErr, ErrContentTypeBlocked) && !errors.Is(lastErr, ErrContentTypeNotAllowed) {
 					shouldRetry = true
 				} else if lastResp != nil && (lastResp.StatusCode == http.StatusTooManyRequests || lastResp.StatusCode >= 500) {
 					shouldRetry = true
@@ -282,6 +303,10 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 		WithRetries(cpyCfg.maxRetries, cpyCfg.retryBackoff),
 		WithRotateTorOnRetry(cpyCfg.rotateTorOnRetry),
 		WithRetryCondition(cpyCfg.retryCondition),
+		WithMaxContentLength(cpyCfg.maxContentLength),
+		WithAllowedContentTypes(cpyCfg.allowedContentTypes...),
+		WithBlockedContentTypes(cpyCfg.blockedContentTypes...),
+		WithContentFilter(cpyCfg.contentFilter),
 	)
 }
 

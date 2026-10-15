@@ -1,12 +1,14 @@
 package torscraper
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,14 +23,23 @@ type Response struct {
 	Headers     http.Header
 	Cookies     []*http.Cookie
 	RawResponse *http.Response
+	ContentInfo *ContentInfo
 
 	rawBody []byte
 	bodyErr error
 	once    sync.Once
 }
 
-// newResponse creates a Response from an *http.Response, buffering the body safely.
-func newResponse(raw *http.Response) (*Response, error) {
+type responseConfig struct {
+	maxContentLength    int64
+	allowedContentTypes []string
+	blockedContentTypes []string
+	contentFilter       ContentFilter
+	urlPath             string
+}
+
+// newResponse creates a Response from an *http.Response with two-stage content detection and safety limits.
+func newResponse(raw *http.Response, cfg *responseConfig) (*Response, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("nil http.Response")
 	}
@@ -41,15 +52,128 @@ func newResponse(raw *http.Response) (*Response, error) {
 		RawResponse: raw,
 	}
 
-	// Decompress and read body immediately, then close raw body
+	maxLimit := DefaultMaxContentLength
+	var allowed []string
+	var blocked []string
+	var filter ContentFilter
+	var urlPath string
+
+	if cfg != nil {
+		maxLimit = cfg.maxContentLength
+		allowed = cfg.allowedContentTypes
+		blocked = cfg.blockedContentTypes
+		filter = cfg.contentFilter
+		urlPath = cfg.urlPath
+	}
+
+	// -----------------------------------------------------------------
+	// Stage 1: Zero-Byte Header Preflight (Instant Abort)
+	// -----------------------------------------------------------------
+	// 1a. Check declared Content-Length
+	if maxLimit > 0 && raw.ContentLength > maxLimit {
+		_ = raw.Body.Close()
+		return resp, ErrContentLengthExceeded
+	}
+
+	// 1b. Check declared Content-Type against blocked/allowed lists
+	declaredType := raw.Header.Get("Content-Type")
+	if declaredType != "" {
+		mediaType, _, err := mime.ParseMediaType(declaredType)
+		if err == nil {
+			mediaType = strings.ToLower(mediaType)
+		} else {
+			mediaType = strings.ToLower(strings.TrimSpace(strings.Split(declaredType, ";")[0]))
+		}
+
+		// Check blocked list
+		for _, pattern := range blocked {
+			if MatchesContentType(mediaType, pattern) {
+				_ = raw.Body.Close()
+				return resp, ErrContentTypeBlocked
+			}
+		}
+
+		// Check allowed list (unless generic octet-stream/text-plain, which we verify in Stage 2)
+		if len(allowed) > 0 && mediaType != "application/octet-stream" && mediaType != "text/plain" {
+			matched := false
+			for _, pattern := range allowed {
+				if MatchesContentType(mediaType, pattern) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				_ = raw.Body.Close()
+				return resp, ErrContentTypeNotAllowed
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// Stage 2: Streaming Magic-Byte Sniffing (Peek first 512b)
+	// -----------------------------------------------------------------
 	defer raw.Body.Close()
+
 	decompressedReader, err := decompressReader(raw.Body, raw.Header.Get("Content-Encoding"))
 	if err != nil {
-		// Fallback to reading raw body if decompression stream fails to initialize
-		resp.rawBody, resp.bodyErr = io.ReadAll(raw.Body)
+		decompressedReader = raw.Body
 	} else {
 		defer decompressedReader.Close()
-		resp.rawBody, resp.bodyErr = io.ReadAll(decompressedReader)
+	}
+
+	// Wrap in bufio.Reader to peek without consuming the stream
+	br := bufio.NewReader(decompressedReader)
+	peeked, _ := br.Peek(512)
+
+	// Detect content info from headers + peeked magic bytes + urlPath
+	contentInfo := DetectContent(raw, peeked, urlPath)
+	resp.ContentInfo = contentInfo
+
+	// Check blocked list against verified sniffed/media type
+	for _, pattern := range blocked {
+		if MatchesContentType(contentInfo.MediaType, pattern) || (contentInfo.SniffedType != "" && MatchesContentType(contentInfo.SniffedType, pattern)) {
+			return resp, ErrContentTypeBlocked
+		}
+	}
+
+	// Check allowed list against verified sniffed/media type
+	if len(allowed) > 0 {
+		matched := false
+		for _, pattern := range allowed {
+			if MatchesContentType(contentInfo.MediaType, pattern) || (contentInfo.SniffedType != "" && MatchesContentType(contentInfo.SniffedType, pattern)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return resp, ErrContentTypeNotAllowed
+		}
+	}
+
+	// Run custom user middleware hook if set
+	if filter != nil {
+		if err := filter(contentInfo, raw); err != nil {
+			return resp, fmt.Errorf("%w: %v", ErrContentRejected, err)
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// Stage 3: Read stream with MaxContentLength limit protection
+	// -----------------------------------------------------------------
+	if maxLimit > 0 {
+		// Read at most maxLimit + 1 bytes to detect overflow on chunked streams
+		limitedReader := io.LimitReader(br, maxLimit+1)
+		resp.rawBody, resp.bodyErr = io.ReadAll(limitedReader)
+		if int64(len(resp.rawBody)) > maxLimit {
+			resp.rawBody = nil
+			return resp, ErrContentLengthExceeded
+		}
+	} else {
+		resp.rawBody, resp.bodyErr = io.ReadAll(br)
+	}
+
+	if resp.ContentInfo != nil {
+		resp.ContentInfo.EmptyBody = len(resp.rawBody) == 0
 	}
 
 	return resp, resp.bodyErr
