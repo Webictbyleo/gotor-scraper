@@ -486,6 +486,22 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		rawBody:     bodyBytes,
 	}
 
+	// Inspect rendered content for anti-bot challenge or WAF mitigation
+	abDetection := resp.AntiBot()
+	if abDetection != nil && abDetection.Detected {
+		if c.cfg.hooks != nil && c.cfg.hooks.OnAntiBot != nil {
+			c.cfg.hooks.OnAntiBot(req, resp, abDetection)
+		}
+
+		if c.cfg.abortOnAntiBot {
+			blockedErr := &BlockedError{Detection: abDetection}
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, blockedErr, 1)
+			}
+			return resp, blockedErr
+		}
+	}
+
 	// Fire OnResponse lifecycle hook
 	if c.cfg.hooks != nil && c.cfg.hooks.OnResponse != nil {
 		c.cfg.hooks.OnResponse(resp, time.Since(start))

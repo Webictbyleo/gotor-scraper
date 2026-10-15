@@ -3,10 +3,43 @@ package torscraper
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
 )
+
+// ErrAntiBotBlocked is returned when an anti-bot or WAF challenge/block is detected
+// and fail-fast abort is enabled (WithBlockOnAntiBot / WithAbortOnAntiBot).
+var ErrAntiBotBlocked = errors.New("request blocked by anti-bot defense system")
+
+// BlockedError is a detailed typed error that wraps ErrAntiBotBlocked with full detection telemetry.
+type BlockedError struct {
+	Detection *AntiBotDetection
+}
+
+func (e *BlockedError) Error() string {
+	if e == nil || e.Detection == nil {
+		return ErrAntiBotBlocked.Error()
+	}
+	ref := ""
+	if e.Detection.IncidentID != "" {
+		ref = fmt.Sprintf(" [Incident/Ref: %s]", e.Detection.IncidentID)
+	}
+	return fmt.Sprintf("%s: provider=%s, type=%s, hint=%s%s (%s)",
+		ErrAntiBotBlocked.Error(),
+		e.Detection.Provider,
+		e.Detection.ChallengeType,
+		e.Detection.ActionHint,
+		ref,
+		e.Detection.Reason,
+	)
+}
+
+func (e *BlockedError) Unwrap() error {
+	return ErrAntiBotBlocked
+}
 
 // BotProvider identifies the Web Application Firewall (WAF) or anti-bot defense vendor.
 type BotProvider string

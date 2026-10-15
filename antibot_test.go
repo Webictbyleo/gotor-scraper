@@ -1,7 +1,9 @@
 package torscraper
 
 import (
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -281,5 +283,75 @@ func TestAntiBotDetection(t *testing.T) {
 				t.Errorf("IncidentID = %q, want %q", result.IncidentID, tt.checkIncident)
 			}
 		})
+	}
+}
+
+func TestAbortOnAntiBot(t *testing.T) {
+	// Create mock server returning Cloudflare 1020 block
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("CF-RAY", "1234567890abcdef-LHR")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<html><head><title>Access Denied</title></head><body>error 1020 access denied</body></html>"))
+	}))
+	defer ts.Close()
+
+	// 1. Test client with WithAbortOnAntiBot(true)
+	var antiBotHookCalled bool
+	var detectedProvider BotProvider
+
+	client, err := NewClient(
+		WithAbortOnAntiBot(true),
+		WithHooks(Hooks{
+			OnAntiBot: func(req *http.Request, resp *Response, detection *AntiBotDetection) {
+				antiBotHookCalled = true
+				detectedProvider = detection.Provider
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx := t.Context()
+	resp, reqErr := client.Get(ctx, ts.URL)
+
+	if reqErr == nil {
+		t.Fatal("Expected error when WithAbortOnAntiBot is true, got nil")
+	}
+
+	if !errors.Is(reqErr, ErrAntiBotBlocked) {
+		t.Fatalf("Expected errors.Is(reqErr, ErrAntiBotBlocked), got: %v", reqErr)
+	}
+
+	var blockedErr *BlockedError
+	if !errors.As(reqErr, &blockedErr) {
+		t.Fatalf("Expected errors.As(reqErr, &blockedErr), got: %T", reqErr)
+	}
+
+	if blockedErr.Detection.Provider != BotProviderCloudflare {
+		t.Errorf("Expected blocked error provider cloudflare, got: %v", blockedErr.Detection.Provider)
+	}
+
+	if !antiBotHookCalled {
+		t.Error("Expected OnAntiBot hook to be called")
+	}
+
+	if detectedProvider != BotProviderCloudflare {
+		t.Errorf("Expected OnAntiBot hook provider cloudflare, got: %v", detectedProvider)
+	}
+
+	if resp == nil {
+		t.Fatal("Expected response object to be returned alongside error for caller inspection")
+	}
+
+	// 2. Test request-level override: ReqWithAbortOnAntiBot(false) allows normal return
+	resp2, err2 := client.Get(ctx, ts.URL, ReqWithAbortOnAntiBot(false))
+	if err2 != nil {
+		t.Fatalf("Expected nil error when ReqWithAbortOnAntiBot(false) overrides client, got: %v", err2)
+	}
+	if !resp2.IsBlocked() {
+		t.Errorf("Expected resp2.IsBlocked() to be true")
 	}
 }

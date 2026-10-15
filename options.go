@@ -30,6 +30,7 @@ type clientConfig struct {
 	sessionDir          string
 	sessionName         string
 	autoSaveSession     bool
+	abortOnAntiBot      bool
 }
 
 func defaultClientConfig() *clientConfig {
@@ -271,6 +272,22 @@ type requestOptions struct {
 	allowedContentTypes []string
 	blockedContentTypes []string
 	contentFilter       ContentFilter
+	abortOnAntiBot      *bool
+}
+
+// WithAbortOnAntiBot configures the client to immediately abort and return ErrAntiBotBlocked
+// whenever any anti-bot or WAF challenge/block is detected, rather than returning interstitial HTML.
+func WithAbortOnAntiBot(abort bool) ClientOption {
+	return func(c *clientConfig) {
+		c.abortOnAntiBot = abort
+	}
+}
+
+// ReqWithAbortOnAntiBot overrides the anti-bot abort behavior for an individual request.
+func ReqWithAbortOnAntiBot(abort bool) RequestOption {
+	return func(ro *requestOptions) {
+		ro.abortOnAntiBot = &abort
+	}
 }
 
 // RequestOption allows customizing an individual request.

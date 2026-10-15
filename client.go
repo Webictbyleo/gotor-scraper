@@ -285,6 +285,29 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 					c.cfg.hooks.OnError(req, lastErr, attempt)
 				}
 			} else {
+				// Inspect response for anti-bot challenge or WAF mitigation
+				abDetection := lastResp.AntiBot()
+				if abDetection != nil && abDetection.Detected {
+					if c.cfg.hooks != nil && c.cfg.hooks.OnAntiBot != nil {
+						c.cfg.hooks.OnAntiBot(req, lastResp, abDetection)
+					}
+
+					// Check if fail-fast abort on anti-bot is requested
+					abort := c.cfg.abortOnAntiBot
+					if ro.abortOnAntiBot != nil {
+						abort = *ro.abortOnAntiBot
+					}
+
+					if abort {
+						lastErr = &BlockedError{Detection: abDetection}
+						if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+							c.cfg.hooks.OnError(req, lastErr, attempt)
+						}
+						// Clean fail-fast abort: do not retry, stop immediately
+						return lastResp, lastErr
+					}
+				}
+
 				if c.cfg.hooks != nil && c.cfg.hooks.OnResponse != nil {
 					c.cfg.hooks.OnResponse(lastResp, duration)
 				}

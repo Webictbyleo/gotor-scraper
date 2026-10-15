@@ -21,6 +21,9 @@ type Hooks struct {
 
 	// OnProxyRotate is invoked when traffic switches to a different proxy node.
 	OnProxyRotate func(oldProxy, newProxy string)
+
+	// OnAntiBot is invoked whenever an anti-bot defense or challenge wall is detected.
+	OnAntiBot func(req *http.Request, resp *Response, detection *AntiBotDetection)
 }
 
 // Clone creates a shallow copy of Hooks.
