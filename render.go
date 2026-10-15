@@ -435,6 +435,9 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		urlPath = finalURL.Path
 	}
 	contentInfo := DetectContent(rawResp, bodyBytes, urlPath)
+	if contentInfo.ContentLength <= 0 {
+		contentInfo.ContentLength = int64(len(bodyBytes))
+	}
 
 	// Check blocked content types on post-rendered content
 	for _, pattern := range c.cfg.blockedContentTypes {
