@@ -1,6 +1,8 @@
 package torscraper
 
 import (
+	"math/rand"
+
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -105,4 +107,32 @@ func GetProfileConfig(profile BrowserProfile) ProfileConfig {
 			DefaultHeaders: map[string]string{},
 		}
 	}
+}
+
+// ProfileRotationMode defines how browser fingerprints and User-Agents are rotated.
+type ProfileRotationMode int
+
+const (
+	// RotateDisabled keeps the configured profile static.
+	RotateDisabled ProfileRotationMode = iota
+
+	// RotatePerRequest picks a new synchronized profile for every request.
+	RotatePerRequest
+
+	// RotatePerSession picks a random profile on client initialization.
+	RotatePerSession
+)
+
+// activeRotationProfiles contains synchronized browser profiles for rotation.
+var activeRotationProfiles = []BrowserProfile{
+	ProfileChrome,
+	ProfileFirefox,
+	ProfileSafari,
+	ProfileEdge,
+}
+
+// GetRandomProfileConfig returns a randomly selected synchronized browser profile.
+func GetRandomProfileConfig() ProfileConfig {
+	profile := activeRotationProfiles[rand.Intn(len(activeRotationProfiles))]
+	return GetProfileConfig(profile)
 }

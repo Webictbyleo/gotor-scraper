@@ -29,18 +29,35 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		opt(cfg)
 	}
 
-	// Initialize cookie jar if not explicitly set
+	// Initialize cookie jar: check sessionFile or sessionDir first
 	if cfg.cookieJar == nil {
-		jar, err := cookiejar.New(&cookiejar.Options{
-			PublicSuffixList: publicsuffix.List,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize cookie jar: %w", err)
+		if cfg.sessionFile != "" {
+			jar, err := NewPersistentCookieJar(cfg.sessionFile, cfg.autoSaveSession)
+			if err != nil {
+				return nil, err
+			}
+			cfg.cookieJar = jar
+		} else if cfg.sessionDir != "" {
+			jar, err := NewSessionDirJar(cfg.sessionDir, cfg.sessionName, cfg.autoSaveSession)
+			if err != nil {
+				return nil, err
+			}
+			cfg.cookieJar = jar
+		} else {
+			jar, err := cookiejar.New(&cookiejar.Options{
+				PublicSuffixList: publicsuffix.List,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize cookie jar: %w", err)
+			}
+			cfg.cookieJar = jar
 		}
-		cfg.cookieJar = jar
 	}
 
 	transport := NewCustomTransport(cfg.torConfig, cfg.profile, cfg.insecureSkipVerify, cfg.timeout)
+	if cfg.proxyPool != nil {
+		transport.SetProxyPool(cfg.proxyPool)
+	}
 
 	cli := &http.Client{
 		Transport:     transport,
@@ -118,9 +135,15 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 		opt(ro)
 	}
 
-	// Apply browser profile headers if missing
-	if c.cfg.profile != ProfileNone {
-		prof := GetProfileConfig(c.cfg.profile)
+	// Apply browser profile headers (with optional per-request rotation)
+	activeProfile := c.cfg.profile
+	if c.cfg.profileRotation == RotatePerRequest {
+		prof := GetRandomProfileConfig()
+		for k, v := range prof.DefaultHeaders {
+			req.Header.Set(k, v)
+		}
+	} else if activeProfile != ProfileNone {
+		prof := GetProfileConfig(activeProfile)
 		for k, v := range prof.DefaultHeaders {
 			if req.Header.Get(k) == "" {
 				req.Header.Set(k, v)
@@ -214,10 +237,21 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			}
 		}
 
+		// Trigger OnRequest hook
+		if c.cfg.hooks != nil && c.cfg.hooks.OnRequest != nil {
+			c.cfg.hooks.OnRequest(req)
+		}
+
+		start := time.Now()
 		rawResp, err := caller.Do(req)
+		duration := time.Since(start)
+
 		if err != nil {
 			lastErr = err
 			lastResp = nil
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, err, attempt)
+			}
 		} else {
 			respCfg := &responseConfig{
 				maxContentLength:    c.cfg.maxContentLength,
@@ -240,6 +274,15 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			}
 
 			lastResp, lastErr = newResponse(rawResp, respCfg)
+			if lastErr != nil {
+				if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+					c.cfg.hooks.OnError(req, lastErr, attempt)
+				}
+			} else {
+				if c.cfg.hooks != nil && c.cfg.hooks.OnResponse != nil {
+					c.cfg.hooks.OnResponse(lastResp, duration)
+				}
+			}
 		}
 
 		// Check if we should retry
@@ -257,6 +300,9 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 		}
 
 		if shouldRetry {
+			if c.cfg.hooks != nil && c.cfg.hooks.OnRetry != nil {
+				c.cfg.hooks.OnRetry(req, lastErr, attempt, backoff)
+			}
 			select {
 			case <-req.Context().Done():
 				if lastErr != nil {
@@ -275,6 +321,14 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 	return lastResp, lastErr
 }
 
+// SaveSession flushes cookies to disk if a persistent session file or directory is configured.
+func (c *Client) SaveSession() error {
+	if pj, ok := c.cfg.cookieJar.(*PersistentCookieJar); ok {
+		return pj.Save()
+	}
+	return nil
+}
+
 // Clone creates a new Client sharing the base settings, optionally modified with new options.
 // Useful for creating worker clients with unique Tor circuits or separate cookie jars.
 func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
@@ -290,7 +344,7 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 		opt(&cpyCfg)
 	}
 
-	return NewClient(
+	optsList := []ClientOption{
 		WithTor(cpyCfg.torConfig),
 		WithBrowserProfile(cpyCfg.profile),
 		WithTimeout(cpyCfg.timeout),
@@ -307,7 +361,17 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 		WithAllowedContentTypes(cpyCfg.allowedContentTypes...),
 		WithBlockedContentTypes(cpyCfg.blockedContentTypes...),
 		WithContentFilter(cpyCfg.contentFilter),
-	)
+		WithProxyPool(cpyCfg.proxyPool),
+		WithProfileRotation(cpyCfg.profileRotation),
+		WithSessionFile(cpyCfg.sessionFile),
+		WithSessionDir(cpyCfg.sessionDir, cpyCfg.sessionName),
+		WithAutoSaveSession(cpyCfg.autoSaveSession),
+	}
+	if cpyCfg.hooks != nil {
+		optsList = append(optsList, WithHooks(*cpyCfg.hooks))
+	}
+
+	return NewClient(optsList...)
 }
 
 // Close closes any open/idle connections in the client transport.

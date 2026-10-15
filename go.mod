@@ -10,6 +10,9 @@ require (
 )
 
 require (
+	github.com/chromedp/cdproto v0.157.8 // indirect
+	github.com/chromedp/chromedp v0.21.0 // indirect
+	github.com/go-json-experiment/json v0.0.0-20260213210345-44df1a37e875 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect

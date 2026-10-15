@@ -23,6 +23,13 @@ type clientConfig struct {
 	allowedContentTypes []string
 	blockedContentTypes []string
 	contentFilter       ContentFilter
+	proxyPool           *ProxyPool
+	profileRotation     ProfileRotationMode
+	hooks               *Hooks
+	sessionFile         string
+	sessionDir          string
+	sessionName         string
+	autoSaveSession     bool
 }
 
 func defaultClientConfig() *clientConfig {
@@ -40,6 +47,8 @@ func defaultClientConfig() *clientConfig {
 		maxContentLength:    DefaultMaxContentLength, // 10MB safety guard
 		allowedContentTypes: nil,
 		blockedContentTypes: nil,
+		profileRotation:     RotateDisabled,
+		autoSaveSession:     true,
 	}
 }
 
@@ -205,6 +214,49 @@ func WithBlockedContentTypes(types ...string) ClientOption {
 func WithContentFilter(filter ContentFilter) ClientOption {
 	return func(c *clientConfig) {
 		c.contentFilter = filter
+	}
+}
+
+// WithProxyPool configures a pool of proxies (Tor, SOCKS5, HTTP) with rotation and health monitoring.
+func WithProxyPool(pool *ProxyPool) ClientOption {
+	return func(c *clientConfig) {
+		c.proxyPool = pool
+	}
+}
+
+// WithProfileRotation enables synchronized rotation of browser TLS ClientHello fingerprints and User-Agent headers.
+func WithProfileRotation(mode ProfileRotationMode) ClientOption {
+	return func(c *clientConfig) {
+		c.profileRotation = mode
+	}
+}
+
+// WithHooks registers lifecycle event callbacks for logging and observability.
+func WithHooks(hooks Hooks) ClientOption {
+	return func(c *clientConfig) {
+		c.hooks = hooks.Clone()
+	}
+}
+
+// WithSessionFile configures automatic cookie persistence to a JSON file.
+func WithSessionFile(filePath string) ClientOption {
+	return func(c *clientConfig) {
+		c.sessionFile = filePath
+	}
+}
+
+// WithSessionDir configures automatic cookie persistence inside a session directory.
+func WithSessionDir(dirPath, sessionName string) ClientOption {
+	return func(c *clientConfig) {
+		c.sessionDir = dirPath
+		c.sessionName = sessionName
+	}
+}
+
+// WithAutoSaveSession controls whether cookies are automatically flushed to disk upon receiving Set-Cookie.
+func WithAutoSaveSession(autoSave bool) ClientOption {
+	return func(c *clientConfig) {
+		c.autoSaveSession = autoSave
 	}
 }
 

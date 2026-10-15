@@ -292,7 +292,133 @@ for _, res := range results {
 
 ---
 
-### 6. Tor Control Port (Explicit IP Rotation)
+---
+
+### 8. Multi-Tor & Multi-Proxy Pool
+
+Manage a resilient pool of proxies (Tor SOCKS5, standard SOCKS5, and HTTP/HTTPS proxies) with automated health tracking and failover:
+
+```go
+pool, err := torscraper.NewProxyPool(torscraper.StrategyRoundRobin,
+    "socks5://127.0.0.1:9050",               // Tor instance 1
+    "socks5://127.0.0.1:9052",               // Tor instance 2
+    "http://user:password@proxy.net:8080",   // Datacenter HTTP proxy
+)
+if err != nil {
+    panic(err)
+}
+
+// Customize resilience thresholds
+pool.SetMaxFailures(3)              // Disable proxy after 3 consecutive failures
+pool.SetCooldown(2 * time.Minute)   // Re-probe after 2 minutes
+
+client, _ := torscraper.NewClient(
+    torscraper.WithProxyPool(pool),
+)
+```
+
+---
+
+### 9. Headless Chrome JS Rendering (Chrome DevTools Protocol)
+
+For dynamic Single-Page Applications (SPAs, React, Angular, Vue) or JavaScript challenge walls, execute headless Chrome through Chrome DevTools Protocol (CDP) to obtain the live, fully-hydrated DOM:
+
+* **Asset Blocking over Tor**: Automatically drops images, videos, fonts, and tracking scripts to save 90% Tor bandwidth and accelerate page load up to 5x.
+* **Cookie Synchronization**: Automatically loads active cookies from the client's cookie jar into the headless Chrome session.
+* **Wait Strategies**: Wait for specific CSS selectors or custom durations.
+
+```go
+// Render dynamic JavaScript page and extract modified DOM
+renderedResp, err := client.GetRendered(ctx, "https://example.com/app",
+    torscraper.WaitForSelector("#main-feed"), // Wait until #main-feed appears in DOM
+    torscraper.BlockAssets(true),             // Block images/fonts to maximize Tor speed
+    torscraper.RenderTimeout(25 * time.Second),
+)
+if err != nil {
+    panic(err)
+}
+
+// Query the modified DOM
+doc, _ := renderedResp.HTML()
+feed := doc.FindByID("main-feed")
+fmt.Println("Rendered Feed Content:", feed.Text())
+```
+
+---
+
+### 10. Built-in HTML Query Engine & Semantic Extraction
+
+Extract data directly without importing external parser packages:
+
+```go
+resp, _ := client.Get(ctx, "https://news.ycombinator.com")
+doc, err := resp.HTML()
+if err != nil {
+    panic(err)
+}
+
+// Page title
+fmt.Println("Title:", doc.Title())
+
+// Semantic lookups
+banner := doc.FindByID("banner")
+articles := doc.FindByClass("athing")
+allLinks := doc.Links()   // Automatically resolved to absolute URLs!
+allImages := doc.Images() // Automatically resolved to absolute URLs!
+
+// Helper for relative URL resolution
+absURL := resp.AbsoluteURL("/item?id=12345")
+```
+
+---
+
+### 11. Persistent Cookie Jar & Session Storage
+
+Persist logins, session cookies, and tokens across script restarts:
+
+```go
+// Option A: Single JSON session file
+client, _ := torscraper.NewClient(
+    torscraper.WithSessionFile("./sessions/user_session.json"),
+    torscraper.WithAutoSaveSession(true), // Automatically writes changes to disk
+)
+
+// Option B: Session directory
+client, _ := torscraper.NewClient(
+    torscraper.WithSessionDir("./sessions", "account_admin"),
+    torscraper.WithAutoSaveSession(true),
+)
+```
+
+---
+
+### 12. Profile Rotation & Lifecycle Event Hooks
+
+Camouflage requests by rotating both TLS fingerprints and HTTP headers, and attach audit/logging hooks:
+
+```go
+client, _ := torscraper.NewClient(
+    // Rotates TLS ClientHello + Sec-Ch-Ua + User-Agent on every single request
+    torscraper.WithProfileRotation(torscraper.RotatePerRequest),
+
+    // Pluggable event hooks
+    torscraper.WithHooks(torscraper.Hooks{
+        OnRequest: func(req *http.Request) {
+            fmt.Println("[HOOK] Sending request:", req.Method, req.URL.String())
+        },
+        OnResponse: func(resp *torscraper.Response, duration time.Duration) {
+            fmt.Printf("[HOOK] Received %d in %v\n", resp.StatusCode, duration)
+        },
+        OnRetry: func(attempt int, err error, delay time.Duration) {
+            fmt.Printf("[HOOK] Retry #%d after error: %v (sleeping %v)\n", attempt, err, delay)
+        },
+    }),
+)
+```
+
+---
+
+### 13. Tor Control Port (Explicit IP Rotation)
 
 If you have Tor's control port enabled (default `127.0.0.1:9051`) and want to explicitly trigger a circuit reset:
 

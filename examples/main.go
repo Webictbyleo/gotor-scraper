@@ -130,7 +130,54 @@ func main() {
 		}
 	}
 
+	// -------------------------------------------------------------------------
+	// 5. HTML Querying & Semantic Extraction
+	// -------------------------------------------------------------------------
+	fmt.Println("\n[5] Demonstrating Built-in HTML Querying & Link Extraction...")
+	htmlResp, err := directClient.Get(ctx, "https://httpbin.org/html")
+	if err == nil && htmlResp.IsSuccess() {
+		doc, err := htmlResp.HTML()
+		if err == nil {
+			fmt.Printf("-> Page Title: %s\n", doc.Title())
+			headings := doc.FindByTag("h1")
+			for _, h := range headings {
+				fmt.Printf("   H1 Heading: %s\n", h.Text())
+			}
+			links := doc.Links()
+			fmt.Printf("   Extracted %d links from page\n", len(links))
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 6. Multi-Proxy Pool (Round-Robin with Auto Health Checks)
+	// -------------------------------------------------------------------------
+	fmt.Println("\n[6] Demonstrating Multi-Tor / Multi-Proxy Pool...")
+	proxyPool, err := torscraper.NewProxyPool(torscraper.StrategyRoundRobin,
+		"socks5://127.0.0.1:9050",
+		"socks5://127.0.0.1:9052",
+		"http://127.0.0.1:8080",
+	)
+	if err == nil {
+		node, _ := proxyPool.Next()
+		fmt.Printf("-> Selected Proxy: %s (Healthy: %v)\n", node.RawURL, node.IsHealthy())
+	}
+
+	// -------------------------------------------------------------------------
+	// 7. Headless Chrome JS Rendering with Asset Blocking
+	// -------------------------------------------------------------------------
+	fmt.Println("\n[7] Demonstrating Headless Chrome CDP Dynamic Rendering...")
+	renderedResp, err := directClient.GetRendered(ctx, "https://httpbin.org/html",
+		torscraper.WaitForSelector("h1"),
+		torscraper.BlockAssets(true),
+	)
+	if err != nil {
+		fmt.Printf("-> Headless Chrome rendered skipped or errored: %v\n", err)
+	} else {
+		renderedDoc, _ := renderedResp.HTML()
+		fmt.Printf("-> Fully Rendered Title: %s (Status: %d)\n", renderedDoc.Title(), renderedResp.StatusCode)
+	}
+
 	fmt.Println("\n=================================================================")
-	fmt.Println("Scraper demonstration completed successfully.")
+	fmt.Println("All scraper capabilities demonstrated successfully.")
 	fmt.Println("=================================================================")
 }

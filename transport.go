@@ -22,6 +22,7 @@ import (
 // 3. HTTP/2 and HTTP/1.1 ALPN multiplexing and connection pooling
 type CustomTransport struct {
 	torConfig          *TorConfig
+	proxyPool          *ProxyPool
 	profile            BrowserProfile
 	insecureSkipVerify bool
 	timeout            time.Duration
@@ -81,8 +82,26 @@ func NewCustomTransport(torCfg *TorConfig, profile BrowserProfile, insecure bool
 	return t
 }
 
-// getDialer returns the appropriate dialer (Tor SOCKS5 or direct net.Dialer).
+// SetProxyPool assigns a proxy pool to the transport.
+func (t *CustomTransport) SetProxyPool(pool *ProxyPool) {
+	t.proxyPool = pool
+}
+
+// SetProfile updates the active browser profile.
+func (t *CustomTransport) SetProfile(p BrowserProfile) {
+	t.profile = p
+}
+
+// getDialer returns the appropriate dialer (ProxyPool, Tor SOCKS5, or direct net.Dialer).
 func (t *CustomTransport) getDialer(ctx context.Context) (proxy.ContextDialer, error) {
+	if t.proxyPool != nil {
+		node, err := t.proxyPool.Next()
+		if err != nil {
+			return nil, err
+		}
+		return t.proxyPool.DialerForNode(ctx, node, t.timeout)
+	}
+
 	if t.torConfig != nil && t.torConfig.Enabled {
 		var auth *proxy.Auth
 		if t.torConfig.StreamIsolation {
