@@ -493,7 +493,7 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 			c.cfg.hooks.OnAntiBot(req, resp, abDetection)
 		}
 
-		if c.cfg.abortOnAntiBot {
+		if c.cfg.abortOnAntiBot && resp.IsBlocked() {
 			blockedErr := &BlockedError{Detection: abDetection}
 			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
 				c.cfg.hooks.OnError(req, blockedErr, 1)

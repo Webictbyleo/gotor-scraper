@@ -355,3 +355,113 @@ func TestAbortOnAntiBot(t *testing.T) {
 		t.Errorf("Expected resp2.IsBlocked() to be true")
 	}
 }
+
+func TestEmbeddableWidgetEdgeCases(t *testing.T) {
+	// =========================================================================
+	// Edge Case A: Embedded Widget on Normal Content Page
+	// (Article content with an inline Turnstile / reCAPTCHA widget protecting a comment form)
+	// => ScopeInlineWidget, IsGatekeeper=false, IsBlocked()=false.
+	// WithAbortOnAntiBot MUST NOT abort so product/article content is read successfully!
+	// =========================================================================
+	pageWithInlineWidget := `<!DOCTYPE html>
+<html>
+<head>
+    <title>10 Best Practices for Go Scrapers - Webict Blog</title>
+</head>
+<body>
+    <article>
+        <h1>10 Best Practices for Building High Performance Scrapers</h1>
+        <p>Web scraping requires careful consideration of rate limits, fingerprinting, and content detection.</p>
+        <p>In this comprehensive guide, we cover connection reuse, uTLS Camouflage, and headless browser rendering.</p>
+        <section>
+            <h2>Leave a Comment</h2>
+            <form action="/submit-comment" method="POST">
+                <textarea name="comment" placeholder="Write your thoughts..."></textarea>
+                <!-- Embedded Turnstile widget protecting comment submission -->
+                <div class="cf-turnstile" data-sitekey="0x4AAAAAA"></div>
+                <button type="submit">Submit Comment</button>
+            </form>
+        </section>
+    </article>
+</body>
+</html>`
+
+	tsInline := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(pageWithInlineWidget))
+	}))
+	defer tsInline.Close()
+
+	// =========================================================================
+	// Edge Case B: Standalone Widget-Only Page
+	// (HTTP 200 OK, but the widget is the SOLE thing on the page; acting as an interstitial)
+	// => ScopeFullPageWall, IsGatekeeper=true, IsBlocked()=true.
+	// WithAbortOnAntiBot MUST abort to prevent empty junk from polluting crawler pipeline!
+	// =========================================================================
+	standaloneWidgetPage := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Just a moment...</title>
+</head>
+<body>
+    <div class="cf-turnstile" data-sitekey="0x4AAAAAA"></div>
+</body>
+</html>`
+
+	tsStandalone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(standaloneWidgetPage))
+	}))
+	defer tsStandalone.Close()
+
+	client, err := NewClient(
+		WithAbortOnAntiBot(true),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx := t.Context()
+
+	// 1. Verify Edge Case A: Inline Widget does NOT abort, content is fully accessible
+	respInline, errInline := client.Get(ctx, tsInline.URL)
+	if errInline != nil {
+		t.Fatalf("[Edge Case A FAILED] Scraper aborted on inline form widget: %v", errInline)
+	}
+	if respInline.IsBlocked() {
+		t.Errorf("[Edge Case A FAILED] resp.IsBlocked() should be false for inline widget, got true")
+	}
+	abInline := respInline.AntiBot()
+	if abInline.Scope != ScopeInlineWidget {
+		t.Errorf("Expected ScopeInlineWidget, got: %v", abInline.Scope)
+	}
+	if abInline.IsGatekeeper {
+		t.Errorf("Expected IsGatekeeper=false for inline widget on content page")
+	}
+	doc, err := respInline.HTML()
+	if err != nil || doc.Title() != "10 Best Practices for Go Scrapers - Webict Blog" {
+		t.Errorf("Failed to read article content on page with inline widget: title=%q", doc.Title())
+	}
+
+	// 2. Verify Edge Case B: Standalone Widget-Only Page aborts cleanly with ErrAntiBotBlocked
+	respStandalone, errStandalone := client.Get(ctx, tsStandalone.URL)
+	if errStandalone == nil {
+		t.Fatalf("[Edge Case B FAILED] Expected error for standalone widget gatekeeper, got nil")
+	}
+	if !errors.Is(errStandalone, ErrAntiBotBlocked) {
+		t.Fatalf("Expected ErrAntiBotBlocked, got: %v", errStandalone)
+	}
+	if !respStandalone.IsBlocked() {
+		t.Errorf("[Edge Case B FAILED] resp.IsBlocked() should be true for standalone gatekeeper widget")
+	}
+	abStandalone := respStandalone.AntiBot()
+	if abStandalone.Scope != ScopeFullPageWall {
+		t.Errorf("Expected ScopeFullPageWall, got: %v", abStandalone.Scope)
+	}
+	if !abStandalone.IsGatekeeper {
+		t.Errorf("Expected IsGatekeeper=true for standalone widget gatekeeper")
+	}
+}

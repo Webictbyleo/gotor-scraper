@@ -140,6 +140,24 @@ const (
 	ActionHintSolveCaptcha ActionHint = "solve_captcha"
 )
 
+// ProtectionScope distinguishes between a full-page access barrier and an inline embeddable widget.
+type ProtectionScope string
+
+const (
+	// ScopeNone indicates no anti-bot or widget was detected.
+	ScopeNone ProtectionScope = "none"
+
+	// ScopeFullPageWall indicates the anti-bot challenge is an unavoidable barrier blocking
+	// access to the target page content (e.g. 403 Access Denied, 503 Challenge, or an HTTP 200
+	// page where the widget is the sole element on the screen).
+	ScopeFullPageWall ProtectionScope = "full_page_wall"
+
+	// ScopeInlineWidget indicates an embeddable widget (e.g. Turnstile, reCAPTCHA, hCaptcha,
+	// AWS WAF widget) protecting a specific form/button on an otherwise healthy, fully-rendered page.
+	// Normal content (articles, products) is accessible and was NOT blocked.
+	ScopeInlineWidget ProtectionScope = "inline_widget"
+)
+
 // AntiBotDetection contains the parsed verdict and telemetry of an anti-bot inspection.
 type AntiBotDetection struct {
 	// Detected is true if any anti-bot or WAF challenge/block was confirmed.
@@ -150,6 +168,13 @@ type AntiBotDetection struct {
 
 	// ChallengeType indicates whether the block is a JS challenge, interactive captcha, or IP ban.
 	ChallengeType ChallengeType `json:"challenge_type"`
+
+	// Scope indicates whether this is a full-page gatekeeper or an inline form widget.
+	Scope ProtectionScope `json:"scope"`
+
+	// IsGatekeeper is true if the defense actively blocks access to the page content.
+	// When false (e.g. ScopeInlineWidget on a normal article page), page content is readable.
+	IsGatekeeper bool `json:"is_gatekeeper"`
 
 	// Confidence is a score between 0.0 (uncertain) and 1.0 (authoritative header/signature match).
 	Confidence float64 `json:"confidence"`
@@ -224,12 +249,20 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 			hint = ActionHintSolveCaptcha
 		}
 
+		scope, isGatekeeper := classifyWidgetScope(statusCode, body)
+		reason := "Cloudflare Turnstile or JavaScript verification challenge DOM detected"
+		if scope == ScopeInlineWidget {
+			reason = "Cloudflare Turnstile embedded form widget detected on content page (page content accessible)"
+		}
+
 		return &AntiBotDetection{
 			Detected:          true,
 			Provider:          BotProviderCloudflare,
 			ChallengeType:     chType,
+			Scope:             scope,
+			IsGatekeeper:      isGatekeeper,
 			Confidence:        0.99,
-			Reason:            "Cloudflare Turnstile or JavaScript verification challenge DOM detected",
+			Reason:            reason,
 			IncidentID:        extractRayID(headers, body),
 			ActionHint:        hint,
 			MatchedSignatures: []string{"dom:cloudflare_challenge_marker"},
@@ -562,12 +595,20 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 
 	// 7b. AWS WAF Captcha Script in DOM
 	if bytes.Contains(bodyLower, []byte("aws-waf-captcha.js")) || bytes.Contains(bodyLower, []byte("awswafcaptcha.rendercaptcha")) {
+		scope, isGatekeeper := classifyWidgetScope(statusCode, body)
+		reason := "AWS WAF Captcha component embedded in DOM"
+		if scope == ScopeInlineWidget {
+			reason = "AWS WAF Captcha embedded form widget detected on content page (page content accessible)"
+		}
+
 		return &AntiBotDetection{
 			Detected:          true,
 			Provider:          BotProviderAWSWAF,
 			ChallengeType:     ChallengeInteractive,
+			Scope:             scope,
+			IsGatekeeper:      isGatekeeper,
 			Confidence:        0.98,
-			Reason:            "AWS WAF Captcha JavaScript component embedded in DOM",
+			Reason:            reason,
 			ActionHint:        ActionHintSolveCaptcha,
 			MatchedSignatures: []string{"dom:aws-waf-captcha"},
 		}
@@ -601,18 +642,22 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 		bytes.Contains(bodyLower, []byte("class=\"g-recaptcha\"")) ||
 		bytes.Contains(bodyLower, []byte("g-recaptcha-response")) {
 
-		// Avoid false positives: verify page is a challenge interstitial or 403,
-		// or if <title> denotes a captcha wall.
-		if isChallengeContext(statusCode, bodyLower) {
-			return &AntiBotDetection{
-				Detected:          true,
-				Provider:          BotProviderReCaptcha,
-				ChallengeType:     ChallengeInteractive,
-				Confidence:        0.92,
-				Reason:            "Google reCAPTCHA verification wall detected",
-				ActionHint:        ActionHintSolveCaptcha,
-				MatchedSignatures: []string{"dom:g-recaptcha"},
-			}
+		scope, isGatekeeper := classifyWidgetScope(statusCode, body)
+		reason := "Google reCAPTCHA verification wall detected"
+		if scope == ScopeInlineWidget {
+			reason = "Google reCAPTCHA embedded form widget detected on content page (page content accessible)"
+		}
+
+		return &AntiBotDetection{
+			Detected:          true,
+			Provider:          BotProviderReCaptcha,
+			ChallengeType:     ChallengeInteractive,
+			Scope:             scope,
+			IsGatekeeper:      isGatekeeper,
+			Confidence:        0.92,
+			Reason:            reason,
+			ActionHint:        ActionHintSolveCaptcha,
+			MatchedSignatures: []string{"dom:g-recaptcha"},
 		}
 	}
 
@@ -621,16 +666,22 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 		bytes.Contains(bodyLower, []byte("class=\"h-captcha\"")) ||
 		bytes.Contains(bodyLower, []byte("h-captcha-response")) {
 
-		if isChallengeContext(statusCode, bodyLower) {
-			return &AntiBotDetection{
-				Detected:          true,
-				Provider:          BotProviderHCaptcha,
-				ChallengeType:     ChallengeInteractive,
-				Confidence:        0.92,
-				Reason:            "hCaptcha verification wall detected",
-				ActionHint:        ActionHintSolveCaptcha,
-				MatchedSignatures: []string{"dom:h-captcha"},
-			}
+		scope, isGatekeeper := classifyWidgetScope(statusCode, body)
+		reason := "hCaptcha verification wall detected"
+		if scope == ScopeInlineWidget {
+			reason = "hCaptcha embedded form widget detected on content page (page content accessible)"
+		}
+
+		return &AntiBotDetection{
+			Detected:          true,
+			Provider:          BotProviderHCaptcha,
+			ChallengeType:     ChallengeInteractive,
+			Scope:             scope,
+			IsGatekeeper:      isGatekeeper,
+			Confidence:        0.92,
+			Reason:            reason,
+			ActionHint:        ActionHintSolveCaptcha,
+			MatchedSignatures: []string{"dom:h-captcha"},
 		}
 	}
 
@@ -715,16 +766,19 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 	}
 }
 
-// isChallengeContext determines if an embedded captcha is acting as a wall/blocker
-// rather than an innocuous form element on a normal page (preventing false positives).
-func isChallengeContext(statusCode int, bodyLower []byte) bool {
-	// If the server responded with 403, 405, 429, or 503, it's definitely a gatekeeper
+// classifyWidgetScope inspects an embeddable widget detection on a page and determines
+// whether the widget is acting as a full-page access barrier (blocking page access)
+// or merely protecting an individual element/form on a normal, fully readable page.
+func classifyWidgetScope(statusCode int, body []byte) (ProtectionScope, bool) {
+	// 1. If HTTP status code is a blocking/challenge status, it is always a full-page gatekeeper.
 	if statusCode == http.StatusForbidden || statusCode == http.StatusMethodNotAllowed ||
 		statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable {
-		return true
+		return ScopeFullPageWall, true
 	}
 
-	// If HTTP 200, check if the page title explicitly marks it as a verification page
+	bodyLower := bytes.ToLower(body)
+
+	// 2. Explicit challenge/verification page titles indicate the entire page is a gatekeeper.
 	challengeTitleMarkers := [][]byte{
 		[]byte("<title>security check"),
 		[]byte("<title>verify you are human"),
@@ -734,20 +788,58 @@ func isChallengeContext(statusCode int, bodyLower []byte) bool {
 		[]byte("<title>just a moment"),
 		[]byte("<title>pardon our interruption"),
 		[]byte("<title>attention required!"),
+		[]byte("<title>access to this page has been denied"),
 	}
-
 	for _, tm := range challengeTitleMarkers {
 		if bytes.Contains(bodyLower, tm) {
-			return true
+			return ScopeFullPageWall, true
 		}
 	}
 
-	// Short body (< 2KB) containing a captcha is almost certainly an interstitial wall
-	if len(bodyLower) < 2048 && (bytes.Contains(bodyLower, []byte("captcha")) || bytes.Contains(bodyLower, []byte("robot"))) {
-		return true
+	// 3. Cloudflare challenge-specific runtime script variables indicate a managed challenge page.
+	if bytes.Contains(bodyLower, []byte("window._cf_chl_opt")) ||
+		bytes.Contains(bodyLower, []byte("id=\"cf-challenge-running\"")) {
+		return ScopeFullPageWall, true
 	}
 
-	return false
+	// 4. Standalone Widget Page Detection (Edge Case: Widget is the ONLY content on the page).
+	// If the page body is sparse (e.g. < 2.5KB) and lacks substantial editorial/product content
+	// (no <article>, <main>, <h1>, <h2>, or substantial paragraphs outside the captcha),
+	// it is a standalone gatekeeper challenge.
+	if isStandaloneWidgetPage(bodyLower) {
+		return ScopeFullPageWall, true
+	}
+
+	// 5. Otherwise, the page has rich content (articles, products, navigation) and the widget
+	// is embedded inline protecting a specific form or button.
+	return ScopeInlineWidget, false
+}
+
+// isStandaloneWidgetPage checks if the HTML body contains little to no readable text
+// and exists solely to mount an anti-bot challenge widget.
+func isStandaloneWidgetPage(bodyLower []byte) bool {
+	// Check if the page contains rich content tags (article, main, headings, multiple paragraphs).
+	hasSubstantialContent := bytes.Contains(bodyLower, []byte("<article")) ||
+		bytes.Contains(bodyLower, []byte("<main")) ||
+		bytes.Contains(bodyLower, []byte("<section")) ||
+		bytes.Count(bodyLower, []byte("<p>")) >= 2 ||
+		bytes.Count(bodyLower, []byte("<p ")) >= 2 ||
+		bytes.Contains(bodyLower, []byte("<h1")) ||
+		bytes.Contains(bodyLower, []byte("<h2"))
+
+	if hasSubstantialContent {
+		return false
+	}
+
+	// If it lacks substantial content and contains a widget, it is a standalone gatekeeper.
+	return true
+}
+
+// isChallengeContext determines if an embedded captcha is acting as a wall/blocker
+// rather than an innocuous form element on a normal page (preventing false positives).
+func isChallengeContext(statusCode int, bodyLower []byte) bool {
+	scope, isGatekeeper := classifyWidgetScope(statusCode, bodyLower)
+	return scope == ScopeFullPageWall && isGatekeeper
 }
 
 // extractRayID searches headers and body text for Cloudflare Ray IDs.
@@ -769,10 +861,23 @@ func (r *Response) AntiBot() *AntiBotDetection {
 	return DetectAntiBot(r.RawResponse, r.rawBody)
 }
 
-// IsBlocked returns true if the response was flagged by any WAF or anti-bot defense system.
+// IsBlocked returns true if the response was flagged by an active WAF or anti-bot gatekeeper
+// that prevented access to the requested page content.
+//
+// NOTE: If an embeddable widget (Turnstile, reCAPTCHA, etc.) is detected protecting only
+// an individual form on an otherwise normal, content-rich page (ScopeInlineWidget),
+// IsBlocked returns FALSE so scrapers can read article, product, or catalog text freely.
 func (r *Response) IsBlocked() bool {
 	if r == nil {
 		return false
 	}
-	return r.AntiBot().Detected
+	ab := r.AntiBot()
+	if !ab.Detected {
+		return false
+	}
+	// If scope was explicitly classified, respect IsGatekeeper
+	if ab.Scope == ScopeInlineWidget {
+		return false
+	}
+	return true
 }

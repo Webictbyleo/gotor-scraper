@@ -292,13 +292,15 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 						c.cfg.hooks.OnAntiBot(req, lastResp, abDetection)
 					}
 
-					// Check if fail-fast abort on anti-bot is requested
+					// Check if fail-fast abort on anti-bot is requested.
+					// We abort only if the defense is an active gatekeeper blocking page access
+					// (i.e. lastResp.IsBlocked() is true, NOT when an inline widget exists on a readable content page).
 					abort := c.cfg.abortOnAntiBot
 					if ro.abortOnAntiBot != nil {
 						abort = *ro.abortOnAntiBot
 					}
 
-					if abort {
+					if abort && lastResp.IsBlocked() {
 						lastErr = &BlockedError{Detection: abDetection}
 						if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
 							c.cfg.hooks.OnError(req, lastErr, attempt)
