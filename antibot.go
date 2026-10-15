@@ -137,7 +137,7 @@ type AntiBotDetection struct {
 // Regex patterns for extracting incident reference IDs
 var (
 	reCloudflareRayID   = regexp.MustCompile(`(?i)Ray ID:\s*([a-f0-9]+)`)
-	reAkamaiReference   = regexp.MustCompile(`(?i)Reference\s*#([0-9a-zA-Z.]+)`)
+	reAkamaiReference   = regexp.MustCompile(`(?i)Reference(?:\s*|&#32;)(?:#|&#35;)([0-9a-zA-Z.&#;]+)`)
 	reIncapsulaIncident = regexp.MustCompile(`(?i)Incapsula incident ID:\s*([0-9a-zA-Z\-_]+)`)
 	reF5SupportID       = regexp.MustCompile(`(?i)support ID is:\s*([0-9]+)`)
 )
@@ -207,16 +207,19 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 	if (statusCode == http.StatusForbidden || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusTooManyRequests) &&
 		(strings.Contains(server, "cloudflare") || headers.Get("CF-RAY") != "") {
 
-		if bytes.Contains(bodyLower, []byte("error 1020")) || bytes.Contains(bodyLower, []byte("access denied")) {
+		if bytes.Contains(bodyLower, []byte("error 1020")) || bytes.Contains(bodyLower, []byte("error code: 1010")) ||
+			bytes.Contains(bodyLower, []byte("error 1010")) || bytes.Contains(bodyLower, []byte("error 1006")) ||
+			bytes.Contains(bodyLower, []byte("error 1007")) || bytes.Contains(bodyLower, []byte("error 1008")) ||
+			bytes.Contains(bodyLower, []byte("access denied")) {
 			return &AntiBotDetection{
 				Detected:          true,
 				Provider:          BotProviderCloudflare,
 				ChallengeType:     ChallengeAccessDenied,
 				Confidence:        0.98,
-				Reason:            "Cloudflare Error 1020 Access Denied: IP address or firewall rule block",
+				Reason:            "Cloudflare WAF Access Denied: Firewall security rule or IP reputation block",
 				IncidentID:        extractRayID(headers, body),
 				ActionHint:        ActionHintRotateProxy,
-				MatchedSignatures: []string{"body:error_1020_access_denied", "header:cf-ray"},
+				MatchedSignatures: []string{"body:cloudflare_waf_block", "header:cf-ray"},
 			}
 		}
 		if bytes.Contains(bodyLower, []byte("error 1015")) || statusCode == http.StatusTooManyRequests {
@@ -229,6 +232,19 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 				IncidentID:        extractRayID(headers, body),
 				ActionHint:        ActionHintSleepBackoff,
 				MatchedSignatures: []string{"body:error_1015_rate_limit", "header:cf-ray"},
+			}
+		}
+		// General Cloudflare 403 block with CF-RAY
+		if statusCode == http.StatusForbidden {
+			return &AntiBotDetection{
+				Detected:          true,
+				Provider:          BotProviderCloudflare,
+				ChallengeType:     ChallengeAccessDenied,
+				Confidence:        0.95,
+				Reason:            "Cloudflare WAF 403 Forbidden edge block",
+				IncidentID:        extractRayID(headers, body),
+				ActionHint:        ActionHintRotateProxy,
+				MatchedSignatures: []string{"status:403", "header:cf-ray"},
 			}
 		}
 	}
@@ -312,20 +328,35 @@ func DetectAntiBot(raw *http.Response, body []byte) *AntiBotDetection {
 
 	// 3b. Akamai Reference # Access Denied Page
 	if statusCode == http.StatusForbidden &&
-		(bytes.Contains(bodyLower, []byte("access denied")) || strings.Contains(server, "akamaighost")) {
+		(bytes.Contains(bodyLower, []byte("access denied")) || strings.Contains(server, "akamaighost") || headers.Get("Akamai-GRN") != "") {
 
+		refID := ""
 		if matches := reAkamaiReference.FindSubmatch(body); len(matches) > 1 {
-			refID := string(matches[1])
-			return &AntiBotDetection{
-				Detected:          true,
-				Provider:          BotProviderAkamai,
-				ChallengeType:     ChallengeAccessDenied,
-				Confidence:        0.98,
-				Reason:            "Akamai Ghost WAF Access Denied with Reference ID",
-				IncidentID:        refID,
-				ActionHint:        ActionHintRotateProxy,
-				MatchedSignatures: []string{"body:akamai_reference_denied"},
-			}
+			refID = string(matches[1])
+			refID = strings.ReplaceAll(refID, "&#46;", ".")
+			refID = strings.ReplaceAll(refID, "&#35;", "")
+			refID = strings.ReplaceAll(refID, "&#32;", " ")
+		} else if grn := headers.Get("Akamai-GRN"); grn != "" {
+			refID = grn
+		}
+
+		matchedSigs := []string{"status:403"}
+		if strings.Contains(server, "akamaighost") {
+			matchedSigs = append(matchedSigs, "header:server=akamaighost")
+		}
+		if refID != "" {
+			matchedSigs = append(matchedSigs, "body:akamai_reference_denied")
+		}
+
+		return &AntiBotDetection{
+			Detected:          true,
+			Provider:          BotProviderAkamai,
+			ChallengeType:     ChallengeAccessDenied,
+			Confidence:        0.98,
+			Reason:            "Akamai Ghost WAF Access Denied with Reference ID",
+			IncidentID:        refID,
+			ActionHint:        ActionHintRotateProxy,
+			MatchedSignatures: matchedSigs,
 		}
 	}
 
