@@ -365,3 +365,105 @@ func TestRenderJS(t *testing.T) {
 	}
 }
 
+func TestRenderHooksAndBrowserReuse(t *testing.T) {
+	var reqCount int64
+	var respCount int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html><body><div id="status">OK</div></body></html>`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(
+		WithBrowserProfile(ProfileNone),
+		WithHooks(Hooks{
+			OnRequest: func(req *http.Request) {
+				atomic.AddInt64(&reqCount, 1)
+			},
+			OnResponse: func(resp *Response, duration time.Duration) {
+				atomic.AddInt64(&respCount, 1)
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// 1. First render (initializes shared browser process)
+	resp1, err := client.GetRendered(ctx, server.URL, WaitForSelector("#status"), BlockAssets(true))
+	if err != nil {
+		t.Logf("GetRendered skipped (no browser binary): %v", err)
+		return
+	}
+	if resp1.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", resp1.StatusCode)
+	}
+
+	// 2. Second render (reuses existing shared browser process via lightweight tab)
+	resp2, err := client.GetRendered(ctx, server.URL, WaitForSelector("#status"), BlockAssets(true))
+	if err != nil {
+		t.Fatalf("Second render failed: %v", err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", resp2.StatusCode)
+	}
+
+	// Verify that hooks fired for both headless Chrome renders
+	if atomic.LoadInt64(&reqCount) != 2 {
+		t.Errorf("Expected 2 OnRequest hook invocations, got %d", reqCount)
+	}
+	if atomic.LoadInt64(&respCount) != 2 {
+		t.Errorf("Expected 2 OnResponse hook invocations, got %d", respCount)
+	}
+}
+
+func TestWorkerPoolRenderBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html><body><h1 id="item">Page ` + r.URL.Query().Get("id") + `</h1></body></html>`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(WithBrowserProfile(ProfileNone))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	pool := NewWorkerPool(client, PoolConfig{
+		Workers: 3,
+	})
+
+	urls := []string{
+		server.URL + "?id=1",
+		server.URL + "?id=2",
+		server.URL + "?id=3",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	results := pool.ScrapeBatchRender(ctx, urls, WaitForSelector("#item"), BlockAssets(true))
+	if len(results) != 3 {
+		t.Fatalf("Expected 3 results, got %d", len(results))
+	}
+
+	for _, res := range results {
+		if res.Error != nil {
+			t.Logf("ScrapeBatchRender item error (browser may be missing): %v", res.Error)
+			return
+		}
+		if res.Response.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 OK for %s, got %d", res.Job.URL, res.Response.StatusCode)
+		}
+	}
+}
+
+

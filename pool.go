@@ -12,12 +12,14 @@ import (
 
 // Job represents a single scrape task to be processed by the worker pool.
 type Job struct {
-	ID      string
-	URL     string
-	Method  string
-	Headers map[string]string
-	Payload any
-	Meta    any // Arbitrary user metadata passed along with the job
+	ID         string
+	URL        string
+	Method     string
+	Headers    map[string]string
+	Payload    any
+	Meta       any // Arbitrary user metadata passed along with the job
+	RenderJS   bool
+	RenderOpts []RenderOption
 }
 
 // Result represents the outcome of a processed Job.
@@ -93,6 +95,23 @@ func (p *WorkerPool) ScrapeBatch(ctx context.Context, urls []string) []*Result {
 	return p.Process(ctx, jobs)
 }
 
+// ScrapeBatchRender submits a slice of URLs to be rendered concurrently with headless Chrome.
+// It leverages the Client's shared browser instance, running jobs in parallel browser tabs
+// without the overhead of spawning a new browser process for each URL.
+func (p *WorkerPool) ScrapeBatchRender(ctx context.Context, urls []string, renderOpts ...RenderOption) []*Result {
+	jobs := make([]Job, len(urls))
+	for i, u := range urls {
+		jobs[i] = Job{
+			ID:         fmt.Sprintf("render_job_%d", i+1),
+			URL:        u,
+			Method:     http.MethodGet,
+			RenderJS:   true,
+			RenderOpts: renderOpts,
+		}
+	}
+	return p.Process(ctx, jobs)
+}
+
 // Process executes a batch of Jobs concurrently across the worker pool.
 func (p *WorkerPool) Process(ctx context.Context, jobs []Job) []*Result {
 	jobChan := make(chan Job, len(jobs))
@@ -139,7 +158,7 @@ func (p *WorkerPool) Process(ctx context.Context, jobs []Job) []*Result {
 	return results
 }
 
-// executeJob runs a single job with rate limiting and exponential backoff retry.
+// executeJob runs a single job with rate limiting, optional headless Chrome rendering, and exponential backoff retry.
 func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 	var resp *Response
 	var err error
@@ -160,35 +179,42 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 		}
 
 		start := time.Now()
-		reqOpts := []RequestOption{}
-		if len(job.Headers) > 0 {
-			reqOpts = append(reqOpts, ReqWithHeaders(job.Headers))
-		}
 
-		// If Tor rotation on retry is requested and we are on a retry
-		if retries > 0 && p.config.RotateTorOnRetry && p.client.cfg.torConfig != nil && p.client.cfg.torConfig.Enabled {
-			reqOpts = append(reqOpts, ReqWithTor(&TorConfig{
-				Enabled:         true,
-				ProxyAddr:       p.client.cfg.torConfig.ProxyAddr,
-				StreamIsolation: true, // Forces new circuit
-			}))
-		}
-
-		method := job.Method
-		if method == "" {
-			method = http.MethodGet
-		}
-
-		if method == http.MethodGet {
-			resp, err = p.client.Get(ctx, job.URL, reqOpts...)
-		} else if method == http.MethodPost && job.Payload != nil {
-			resp, err = p.client.PostJSON(ctx, job.URL, job.Payload, reqOpts...)
+		if job.RenderJS {
+			// Execute through headless Chrome CDP (reusing shared browser process tab)
+			resp, err = p.client.GetRendered(ctx, job.URL, job.RenderOpts...)
 		} else {
-			req, rErr := http.NewRequestWithContext(ctx, method, job.URL, nil)
-			if rErr != nil {
-				err = rErr
+			// Execute through standard uTLS HTTP/HTTP2 transport
+			reqOpts := []RequestOption{}
+			if len(job.Headers) > 0 {
+				reqOpts = append(reqOpts, ReqWithHeaders(job.Headers))
+			}
+
+			// If Tor rotation on retry is requested and we are on a retry
+			if retries > 0 && p.config.RotateTorOnRetry && p.client.cfg.torConfig != nil && p.client.cfg.torConfig.Enabled {
+				reqOpts = append(reqOpts, ReqWithTor(&TorConfig{
+					Enabled:         true,
+					ProxyAddr:       p.client.cfg.torConfig.ProxyAddr,
+					StreamIsolation: true, // Forces new circuit
+				}))
+			}
+
+			method := job.Method
+			if method == "" {
+				method = http.MethodGet
+			}
+
+			if method == http.MethodGet {
+				resp, err = p.client.Get(ctx, job.URL, reqOpts...)
+			} else if method == http.MethodPost && job.Payload != nil {
+				resp, err = p.client.PostJSON(ctx, job.URL, job.Payload, reqOpts...)
 			} else {
-				resp, err = p.client.Do(req, reqOpts...)
+				req, rErr := http.NewRequestWithContext(ctx, method, job.URL, nil)
+				if rErr != nil {
+					err = rErr
+				} else {
+					resp, err = p.client.Do(req, reqOpts...)
+				}
 			}
 		}
 		duration = time.Since(start)
@@ -197,12 +223,19 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 		shouldRetry := false
 		if err != nil {
 			shouldRetry = true
-		} else if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		} else if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
 			shouldRetry = true
 		}
 
 		if shouldRetry && retries < p.config.MaxRetries {
 			retries++
+
+			// Trigger OnRetry lifecycle hook if configured
+			if p.client.cfg.hooks != nil && p.client.cfg.hooks.OnRetry != nil {
+				retryReq, _ := http.NewRequestWithContext(ctx, job.Method, job.URL, nil)
+				p.client.cfg.hooks.OnRetry(retryReq, err, retries, backoff)
+			}
+
 			select {
 			case <-ctx.Done():
 				return &Result{

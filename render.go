@@ -31,6 +31,7 @@ type RenderConfig struct {
 	BlockedPatterns []string
 	ProxyURL        string
 	ExecPath        string
+	IsolatedBrowser bool
 	WindowWidth     int
 	WindowHeight    int
 }
@@ -42,6 +43,15 @@ type RenderOption func(*RenderConfig)
 func RenderExecPath(path string) RenderOption {
 	return func(rc *RenderConfig) {
 		rc.ExecPath = path
+	}
+}
+
+// RenderIsolatedBrowser forces the creation of a standalone one-off Chrome process for this scrape,
+// bypassing the Client's shared browser instance pool. By default (false), the Client shares a single
+// persistent Chrome instance and opens lightweight tabs for each scrape to maximize throughput and minimize RAM.
+func RenderIsolatedBrowser(isolated bool) RenderOption {
+	return func(rc *RenderConfig) {
+		rc.IsolatedBrowser = isolated
 	}
 }
 
@@ -80,8 +90,100 @@ func RenderProxy(proxyURL string) RenderOption {
 	}
 }
 
+// buildAllocOpts constructs the command-line flags and profile emulation options for Chrome.
+func (c *Client) buildAllocOpts(rc *RenderConfig) []chromedp.ExecAllocatorOption {
+	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", "new"),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		// Anti-Bot Camouflage: strips navigator.webdriver so fingerprinting scripts
+		// and anti-bot systems (Cloudflare, Datadome) do not detect automated browser control
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.WindowSize(rc.WindowWidth, rc.WindowHeight),
+	)
+
+	// Synchronize browser User-Agent with the client's active emulation profile
+	if c.cfg.profile != ProfileNone {
+		prof := GetProfileConfig(c.cfg.profile)
+		if prof.UserAgent != "" {
+			allocOpts = append(allocOpts, chromedp.UserAgent(prof.UserAgent))
+		}
+	}
+
+	// Route browser traffic through proxy if specified (Tor or custom proxy pool)
+	if rc.ProxyURL != "" {
+		allocOpts = append(allocOpts, chromedp.ProxyServer(rc.ProxyURL))
+	}
+
+	// Set browser binary path or auto-discover installed Chromium/Edge on Windows
+	if rc.ExecPath != "" {
+		allocOpts = append(allocOpts, chromedp.ExecPath(rc.ExecPath))
+	} else if runtime.GOOS == "windows" {
+		candidates := []string{
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+			`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		}
+		for _, cPath := range candidates {
+			if _, err := os.Stat(cPath); err == nil {
+				allocOpts = append(allocOpts, chromedp.ExecPath(cPath))
+				break
+			}
+		}
+	}
+
+	return allocOpts
+}
+
+// getOrCreateBrowser retrieves the existing persistent headless Chrome browser context,
+// or launches a new background browser process if one hasn't been started yet or if it died.
+// Reusing a single browser process across multiple URLs avoids the 1-2s process startup latency
+// and heavy memory footprint of spawning a new Chrome process for every URL.
+func (c *Client) getOrCreateBrowser(ctx context.Context, rc *RenderConfig) (context.Context, error) {
+	c.browserMu.Lock()
+	defer c.browserMu.Unlock()
+
+	// If browser context is already active and healthy, reuse it
+	if c.browserCtx != nil && c.browserCtx.Err() == nil {
+		return c.browserCtx, nil
+	}
+
+	// Clean up any stale or dead context
+	if c.browserCancel != nil {
+		c.browserCancel()
+	}
+	if c.allocCancel != nil {
+		c.allocCancel()
+	}
+
+	allocOpts := c.buildAllocOpts(rc)
+
+	// Use context.Background() as root allocator so individual request deadlines
+	// do NOT terminate the persistent Chrome browser process.
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
+	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+
+	// Warm up browser so process starts once
+	if _, err := chromedp.Run(browserCtx, chromedp.Sleep(0)); err != nil {
+		browserCancel()
+		allocCancel()
+		return nil, fmt.Errorf("failed to start shared headless browser: %w", err)
+	}
+
+	c.allocCancel = allocCancel
+	c.browserCtx = browserCtx
+	c.browserCancel = browserCancel
+
+	return c.browserCtx, nil
+}
+
 // GetRendered executes a full headless Chrome navigation, executes all client-side JavaScript,
 // and returns the modified, fully-rendered DOM wrapped in a standard Response.
+//
+// By default, it reuses the Client's shared browser instance and opens a lightweight browser tab
+// per URL, closing the tab when done while keeping the underlying Chrome process alive for maximum speed.
 func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...RenderOption) (*Response, error) {
 	rc := &RenderConfig{
 		Timeout:         25 * time.Second,
@@ -105,54 +207,51 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		opt(rc)
 	}
 
-	renderCtx, cancel := context.WithTimeout(ctx, rc.Timeout)
-	defer cancel()
+	start := time.Now()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 
-	// Build Chrome command-line allocator options
-	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", "new"),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		// Stealth: removes navigator.webdriver so anti-bot systems cannot detect headless Chrome
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.WindowSize(rc.WindowWidth, rc.WindowHeight),
-	)
-
-	// Set browser User-Agent
-	if c.cfg.profile != ProfileNone {
-		prof := GetProfileConfig(c.cfg.profile)
-		if prof.UserAgent != "" {
-			allocOpts = append(allocOpts, chromedp.UserAgent(prof.UserAgent))
-		}
+	// Fire OnRequest lifecycle hook
+	if c.cfg.hooks != nil && c.cfg.hooks.OnRequest != nil {
+		c.cfg.hooks.OnRequest(req)
 	}
 
-	if rc.ProxyURL != "" {
-		allocOpts = append(allocOpts, chromedp.ProxyServer(rc.ProxyURL))
-	}
+	var taskCtx context.Context
+	var cleanupTab func()
 
-	if rc.ExecPath != "" {
-		allocOpts = append(allocOpts, chromedp.ExecPath(rc.ExecPath))
-	} else if runtime.GOOS == "windows" {
-		candidates := []string{
-			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
-			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-			`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
-			`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+	if rc.IsolatedBrowser {
+		// Standalone mode: spawn a dedicated one-off browser process for this request only
+		allocOpts := c.buildAllocOpts(rc)
+		allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocOpts...)
+		bCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+		tabCtx, cTab := chromedp.NewContext(bCtx)
+		tCtx, cTimeout := context.WithTimeout(tabCtx, rc.Timeout)
+		taskCtx = tCtx
+		cleanupTab = func() {
+			cTimeout()
+			cTab()
+			cancelBrowser()
+			cancelAlloc()
 		}
-		for _, cPath := range candidates {
-			if _, err := os.Stat(cPath); err == nil {
-				allocOpts = append(allocOpts, chromedp.ExecPath(cPath))
-				break
+	} else {
+		// High-performance shared mode: reuse existing Chrome process, allocate only a new tab
+		browserCtx, err := c.getOrCreateBrowser(ctx, rc)
+		if err != nil {
+			if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+				c.cfg.hooks.OnError(req, err, 1)
 			}
+			return nil, err
+		}
+
+		// chromedp.NewContext(browserCtx) opens an isolated target tab inside the running Chrome process
+		tabCtx, cTab := chromedp.NewContext(browserCtx)
+		tCtx, cTimeout := context.WithTimeout(tabCtx, rc.Timeout)
+		taskCtx = tCtx
+		cleanupTab = func() {
+			cTimeout()
+			cTab() // Closes only this tab target; leaves the browser running for subsequent URLs
 		}
 	}
-
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(renderCtx, allocOpts...)
-	defer cancelAlloc()
-
-	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
-	defer cancelTask()
+	defer cleanupTab()
 
 	var tasks []chromedp.Action[chromedp.Void]
 
@@ -199,31 +298,39 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		}
 	}
 
-	// Navigate to page
+	// Navigate to target URL
 	tasks = append(tasks, chromedp.Navigate(targetURL))
 
-	// Wait conditions
+	// Apply DOM wait conditions
 	if rc.WaitForSelector != "" {
 		tasks = append(tasks, chromedp.WaitVisible(chromedp.CSS(rc.WaitForSelector)))
 	} else if rc.WaitDuration > 0 {
 		tasks = append(tasks, chromedp.Sleep(rc.WaitDuration))
 	} else {
-		// Default: wait for document ready
+		// Default: wait for document body ready
 		tasks = append(tasks, chromedp.WaitReady(chromedp.CSS("body")))
 	}
 
-	// Execute setup, navigation, and wait actions
+	// Execute setup, navigation, and wait actions inside browser tab
 	if err := chromedp.Do(taskCtx, tasks...); err != nil {
-		return nil, fmt.Errorf("chromedp rendering failed for %s: %w", targetURL, err)
+		renderErr := fmt.Errorf("chromedp rendering failed for %s: %w", targetURL, err)
+		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+			c.cfg.hooks.OnError(req, renderErr, 1)
+		}
+		return nil, renderErr
 	}
 
 	// Extract the live, hydrated, modified DOM HTML
 	renderedHTML, err := chromedp.Run(taskCtx, chromedp.OuterHTML(chromedp.CSS("html")))
 	if err != nil {
-		return nil, fmt.Errorf("chromedp failed to retrieve outer HTML for %s: %w", targetURL, err)
+		renderErr := fmt.Errorf("chromedp failed to retrieve outer HTML for %s: %w", targetURL, err)
+		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
+			c.cfg.hooks.OnError(req, renderErr, 1)
+		}
+		return nil, renderErr
 	}
 
-	// Wrap in Response
+	// Wrap in standard Response structure
 	rawHeader := make(http.Header)
 	rawHeader.Set("Content-Type", "text/html; charset=utf-8")
 
@@ -248,6 +355,11 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		SniffedType:   "text/html",
 		ContentLength: int64(len(renderedHTML)),
 		IsHTML:        true,
+	}
+
+	// Fire OnResponse lifecycle hook
+	if c.cfg.hooks != nil && c.cfg.hooks.OnResponse != nil {
+		c.cfg.hooks.OnResponse(resp, time.Since(start))
 	}
 
 	return resp, nil

@@ -323,9 +323,12 @@ client, _ := torscraper.NewClient(
 
 For dynamic Single-Page Applications (SPAs, React, Angular, Vue) or JavaScript challenge walls, execute headless Chrome through Chrome DevTools Protocol (CDP) to obtain the live, fully-hydrated DOM:
 
-* **Asset Blocking over Tor**: Automatically drops images, videos, fonts, and tracking scripts to save 90% Tor bandwidth and accelerate page load up to 5x.
+* **Persistent Browser Reuse (Tab Pooling)**: Does **NOT** spawn a new Chrome process for every URL. The `Client` initializes a single shared headless Chrome instance and opens lightweight, isolated browser tabs per URL, closing only the tab when completed. This eliminates the 1-2s process startup penalty and saves massive CPU/RAM.
+* **Full Hooks Integration**: All lifecycle event hooks (`OnRequest`, `OnResponse`, `OnError`, `OnRetry`) execute seamlessly during headless Chrome rendering, giving unified logging and metrics across both HTTP requests and browser renders.
+* **Asset Blocking over Tor**: Automatically drops images, videos, fonts, and tracking scripts to save ~90% Tor bandwidth and accelerate page load up to 5x.
 * **Cookie Synchronization**: Automatically loads active cookies from the client's cookie jar into the headless Chrome session.
-* **Wait Strategies**: Wait for specific CSS selectors or custom durations.
+* **Batch Headless Rendering**: Worker pool supports `pool.ScrapeBatchRender(ctx, urls, ...)` to scrape dozens or hundreds of JavaScript-rendered pages concurrently across browser tabs with rate limiting and retries.
+* **Clean Termination**: Calling `client.Close()` automatically closes all open connections and cleanly terminates the background Chrome process.
 
 ```go
 // Render dynamic JavaScript page and extract modified DOM
@@ -342,6 +345,14 @@ if err != nil {
 doc, _ := renderedResp.HTML()
 feed := doc.FindByID("main-feed")
 fmt.Println("Rendered Feed Content:", feed.Text())
+
+// Batch render multiple URLs concurrently using the shared browser instance:
+pool := torscraper.NewWorkerPool(client, torscraper.PoolConfig{Workers: 5})
+results := pool.ScrapeBatchRender(ctx, []string{
+    "https://example.com/item/1",
+    "https://example.com/item/2",
+    "https://example.com/item/3",
+}, torscraper.WaitForSelector(".loaded"), torscraper.BlockAssets(true))
 ```
 
 ---

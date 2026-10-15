@@ -9,17 +9,23 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"sync"
 	"time"
 
 	"golang.org/x/net/publicsuffix"
 )
 
 // Client represents an aiohttp-style scraping session.
-// It is thread-safe and manages cookies, connection pools, Tor routing, and browser emulation.
+// It is thread-safe and manages cookies, connection pools, Tor routing, browser emulation,
+// and a reusable headless Chrome CDP instance for dynamic JavaScript rendering.
 type Client struct {
-	cfg       *clientConfig
-	transport *CustomTransport
-	httpCli   *http.Client
+	cfg           *clientConfig
+	transport     *CustomTransport
+	httpCli       *http.Client
+	browserMu     sync.Mutex
+	browserCtx    context.Context
+	browserCancel context.CancelFunc
+	allocCancel   context.CancelFunc
 }
 
 // NewClient creates a new Client configured with the provided options.
@@ -374,7 +380,19 @@ func (c *Client) Clone(opts ...ClientOption) (*Client, error) {
 	return NewClient(optsList...)
 }
 
-// Close closes any open/idle connections in the client transport.
+// Close closes any open/idle connections in the client transport and cleanly
+// terminates any background headless Chrome browser process started by GetRendered.
 func (c *Client) Close() {
 	c.transport.CloseIdleConnections()
+	c.browserMu.Lock()
+	defer c.browserMu.Unlock()
+	if c.browserCancel != nil {
+		c.browserCancel()
+		c.browserCancel = nil
+	}
+	if c.allocCancel != nil {
+		c.allocCancel()
+		c.allocCancel = nil
+	}
+	c.browserCtx = nil
 }
