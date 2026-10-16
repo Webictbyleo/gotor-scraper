@@ -167,6 +167,11 @@ func SniffMagicBytes(buf []byte, declaredType string, urlPath string) string {
 			return "text/html"
 		}
 
+		// SVG (including XML-declared SVG documents)
+		if len(trimmed) > 4 && (bytes.HasPrefix(trimmed, []byte("<svg")) || (bytes.HasPrefix(trimmed, []byte("<?xml")) && bytes.Contains(trimmed, []byte("<svg")))) {
+			return "image/svg+xml"
+		}
+
 		// XML declaration
 		if bytes.HasPrefix(trimmed, []byte("<?xml")) {
 			return "text/xml"
@@ -200,10 +205,6 @@ func SniffMagicBytes(buf []byte, declaredType string, urlPath string) string {
 			return "video/quicktime"
 		}
 		return "video/mp4"
-	}
-	// SVG
-	if len(trimmed) > 4 && (bytes.HasPrefix(trimmed, []byte("<svg")) || (bytes.HasPrefix(trimmed, []byte("<?xml")) && bytes.Contains(trimmed, []byte("<svg")))) {
-		return "image/svg+xml"
 	}
 	if bytes.HasPrefix(data, []byte("\x00\x00\x01\x00")) {
 		return "image/x-icon"
@@ -368,6 +369,12 @@ func isBinaryMediaType(mt string) bool {
 
 // MatchesContentType checks if a media type satisfies a pattern (e.g. "image/*", "text/html", "application/json").
 func MatchesContentType(target string, pattern string) bool {
+	if idx := strings.IndexByte(target, ';'); idx != -1 {
+		target = target[:idx]
+	}
+	if idx := strings.IndexByte(pattern, ';'); idx != -1 {
+		pattern = pattern[:idx]
+	}
 	target = strings.ToLower(strings.TrimSpace(target))
 	pattern = strings.ToLower(strings.TrimSpace(pattern))
 

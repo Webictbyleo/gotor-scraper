@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -114,9 +115,10 @@ func newResponse(raw *http.Response, cfg *responseConfig) (*Response, error) {
 	// -----------------------------------------------------------------
 	defer raw.Body.Close()
 
-	decompressedReader, err := decompressReader(raw.Body, raw.Header.Get("Content-Encoding"))
+	rawBr := bufio.NewReader(raw.Body)
+	decompressedReader, err := decompressReader(rawBr, raw.Header.Get("Content-Encoding"))
 	if err != nil {
-		decompressedReader = raw.Body
+		decompressedReader = io.NopCloser(rawBr)
 	} else {
 		defer decompressedReader.Close()
 	}
@@ -174,22 +176,45 @@ func newResponse(raw *http.Response, cfg *responseConfig) (*Response, error) {
 
 	if resp.ContentInfo != nil {
 		resp.ContentInfo.EmptyBody = len(resp.rawBody) == 0
+		if len(resp.rawBody) > len(peeked) {
+			fullAB := DetectAntiBot(raw, resp.rawBody)
+			resp.ContentInfo.AntiBot = fullAB
+			if fullAB != nil && fullAB.Detected {
+				resp.ContentInfo.MismatchDetected = true
+				resp.ContentInfo.MismatchReason = "Anti-bot challenge or block detected: " + fullAB.Reason
+			}
+		}
 	}
 
 	return resp, resp.bodyErr
 }
 
-// decompressReader decodes gzip, deflate, or brotli encodings if present.
+// decompressReader decodes gzip, deflate (RFC 1950 zlib or raw RFC 1951 flate), or brotli encodings if present.
 func decompressReader(r io.Reader, encoding string) (io.ReadCloser, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "gzip":
-		gz, err := gzip.NewReader(r)
+		br := bufio.NewReader(r)
+		if _, err := br.Peek(2); err != nil {
+			return io.NopCloser(br), nil
+		}
+		gz, err := gzip.NewReader(br)
 		if err != nil {
 			return nil, err
 		}
 		return gz, nil
 	case "deflate":
-		return flate.NewReader(r), nil
+		br := bufio.NewReader(r)
+		hdr, err := br.Peek(2)
+		if err == nil && len(hdr) == 2 {
+			// RFC 1950 zlib header check: CM == 8 (deflate), CINFO <= 7, and FCHECK divisible by 31
+			if (hdr[0]&0x0f) == 8 && (hdr[0]>>4) <= 7 && ((int(hdr[0])<<8)|int(hdr[1]))%31 == 0 {
+				zr, zErr := zlib.NewReader(br)
+				if zErr == nil {
+					return zr, nil
+				}
+			}
+		}
+		return flate.NewReader(br), nil
 	case "br":
 		return io.NopCloser(brotli.NewReader(r)), nil
 	default:

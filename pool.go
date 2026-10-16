@@ -1,10 +1,14 @@
 package torscraper
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -183,8 +187,9 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 			// Execute through headless Chrome CDP (reusing shared browser process tab)
 			resp, err = p.client.GetRendered(ctx, job.URL, job.RenderOpts...)
 		} else {
-			// Execute through standard uTLS HTTP/HTTP2 transport
-			reqOpts := []RequestOption{}
+			// Execute through standard uTLS HTTP/HTTP2 transport.
+			// Disable inner client retries so WorkerPool controls retry count exclusively.
+			reqOpts := []RequestOption{ReqWithRetries(0)}
 			if len(job.Headers) > 0 {
 				reqOpts = append(reqOpts, ReqWithHeaders(job.Headers))
 			}
@@ -203,16 +208,41 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 				method = http.MethodGet
 			}
 
-			if method == http.MethodGet {
+			if method == http.MethodGet && job.Payload == nil {
 				resp, err = p.client.Get(ctx, job.URL, reqOpts...)
 			} else if method == http.MethodPost && job.Payload != nil {
 				resp, err = p.client.PostJSON(ctx, job.URL, job.Payload, reqOpts...)
 			} else {
-				req, rErr := http.NewRequestWithContext(ctx, method, job.URL, nil)
-				if rErr != nil {
-					err = rErr
-				} else {
-					resp, err = p.client.Do(req, reqOpts...)
+				var bodyReader io.Reader
+				isJSONPayload := false
+				if job.Payload != nil {
+					switch v := job.Payload.(type) {
+					case io.Reader:
+						bodyReader = v
+					case []byte:
+						bodyReader = bytes.NewReader(v)
+					case string:
+						bodyReader = strings.NewReader(v)
+					default:
+						data, mErr := json.Marshal(job.Payload)
+						if mErr != nil {
+							err = fmt.Errorf("failed to marshal job payload: %w", mErr)
+						} else {
+							bodyReader = bytes.NewReader(data)
+							isJSONPayload = true
+						}
+					}
+				}
+				if err == nil {
+					req, rErr := http.NewRequestWithContext(ctx, method, job.URL, bodyReader)
+					if rErr != nil {
+						err = rErr
+					} else {
+						if isJSONPayload && req.Header.Get("Content-Type") == "" {
+							req.Header.Set("Content-Type", "application/json")
+						}
+						resp, err = p.client.Do(req, reqOpts...)
+					}
 				}
 			}
 		}
@@ -224,7 +254,12 @@ func (p *WorkerPool) executeJob(ctx context.Context, job Job) *Result {
 			if p.client.cfg.retryCondition != nil {
 				shouldRetry = p.client.cfg.retryCondition(resp, err)
 			} else {
-				if err != nil && !errors.Is(err, ErrContentLengthExceeded) && !errors.Is(err, ErrContentTypeBlocked) && !errors.Is(err, ErrContentTypeNotAllowed) && !errors.Is(err, ErrAntiBotBlocked) {
+				if err != nil &&
+					!errors.Is(err, ErrContentLengthExceeded) &&
+					!errors.Is(err, ErrContentTypeBlocked) &&
+					!errors.Is(err, ErrContentTypeNotAllowed) &&
+					!errors.Is(err, ErrContentRejected) &&
+					!errors.Is(err, ErrAntiBotBlocked) {
 					var blockedErr *BlockedError
 					if !errors.As(err, &blockedErr) {
 						shouldRetry = true

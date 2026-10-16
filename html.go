@@ -105,6 +105,9 @@ func (doc *HTMLDocument) Title() string {
 // Supports full CSS3 selector syntax: tag, class (.foo), id (#bar), attributes ([target=_blank]),
 // combinators (div > p, a + span), pseudo-classes (:first-child, :last-child, :nth-child(2), :not(.ignore)).
 func (doc *HTMLDocument) Find(selector string) []*HTMLElement {
+	if doc == nil || doc.root == nil {
+		return nil
+	}
 	sel, err := getOrCompileSelector(selector)
 	if err != nil {
 		return nil
@@ -119,6 +122,9 @@ func (doc *HTMLDocument) Find(selector string) []*HTMLElement {
 
 // FindOne returns the first element in the document matching the given CSS selector, or nil if none match.
 func (doc *HTMLDocument) FindOne(selector string) *HTMLElement {
+	if doc == nil || doc.root == nil {
+		return nil
+	}
 	sel, err := getOrCompileSelector(selector)
 	if err != nil {
 		return nil
@@ -376,12 +382,19 @@ func formatNodeText(root *html.Node) string {
 			}
 		} else if n.Type == html.TextNode {
 			text := normalizeTextChunk(n.Data)
-			if text != "" {
-				// Prevent word collisions between consecutive inline elements
-				if b.Len() > 0 && !endsWithWhitespace(b.String()) && !startsWithWhitespace(n.Data) {
+			if text == "" {
+				// Pure whitespace node between inline elements (e.g. <b>Hello</b> <i>world</i>)
+				if len(n.Data) > 0 && b.Len() > 0 && !endsWithWhitespace(b.String()) {
+					b.WriteString(" ")
+				}
+			} else {
+				if startsWithWhitespace(n.Data) && b.Len() > 0 && !endsWithWhitespace(b.String()) {
 					b.WriteString(" ")
 				}
 				b.WriteString(text)
+				if endsWithWhitespace(n.Data) {
+					b.WriteString(" ")
+				}
 			}
 		}
 

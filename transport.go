@@ -16,6 +16,12 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+type ctxKeyProfile struct{}
+
+func withRequestProfile(ctx context.Context, p BrowserProfile) context.Context {
+	return context.WithValue(ctx, ctxKeyProfile{}, p)
+}
+
 // CustomTransport implements http.RoundTripper with support for:
 // 1. Direct or Tor SOCKS5 routing (with optional Stream Isolation)
 // 2. Browser TLS fingerprinting via uTLS (Chrome, Firefox, Safari, Edge)
@@ -26,6 +32,10 @@ type CustomTransport struct {
 	profile            BrowserProfile
 	insecureSkipVerify bool
 	timeout            time.Duration
+
+	proxyMu       sync.Mutex
+	lastProxy     string
+	onProxyRotate func(oldProxy, newProxy string)
 
 	// HTTP/1.1 fallback / standard transport
 	stdTransport *http.Transport
@@ -61,9 +71,12 @@ func NewCustomTransport(torCfg *TorConfig, profile BrowserProfile, insecure bool
 		},
 	}
 
+	disableKeepAlives := torCopy != nil && torCopy.StreamIsolation
+
 	// Setup standard transport for plain HTTP and ProfileNone requests
 	t.stdTransport = &http.Transport{
 		ForceAttemptHTTP2:   true,
+		DisableKeepAlives:   disableKeepAlives,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
@@ -85,6 +98,16 @@ func NewCustomTransport(torCfg *TorConfig, profile BrowserProfile, insecure bool
 // SetProxyPool assigns a proxy pool to the transport.
 func (t *CustomTransport) SetProxyPool(pool *ProxyPool) {
 	t.proxyPool = pool
+	if pool != nil && t.stdTransport != nil {
+		t.stdTransport.DisableKeepAlives = true
+	}
+}
+
+// SetOnProxyRotate registers a callback invoked when the active proxy changes.
+func (t *CustomTransport) SetOnProxyRotate(fn func(oldProxy, newProxy string)) {
+	t.proxyMu.Lock()
+	t.onProxyRotate = fn
+	t.proxyMu.Unlock()
 }
 
 // SetProfile updates the active browser profile.
@@ -98,6 +121,16 @@ func (t *CustomTransport) getDialer(ctx context.Context) (proxy.ContextDialer, e
 		node, err := t.proxyPool.Next()
 		if err != nil {
 			return nil, err
+		}
+		t.proxyMu.Lock()
+		oldProxy := t.lastProxy
+		newProxy := node.RawURL
+		t.lastProxy = newProxy
+		rotateFn := t.onProxyRotate
+		t.proxyMu.Unlock()
+
+		if oldProxy != "" && oldProxy != newProxy && rotateFn != nil {
+			rotateFn(oldProxy, newProxy)
 		}
 		return t.proxyPool.DialerForNode(ctx, node, t.timeout)
 	}
@@ -118,17 +151,22 @@ func (t *CustomTransport) getDialer(ctx context.Context) (proxy.ContextDialer, e
 
 // RoundTrip executes a single HTTP request.
 func (t *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	activeProfile := t.profile
+	if p, ok := req.Context().Value(ctxKeyProfile{}).(BrowserProfile); ok {
+		activeProfile = p
+	}
+
 	// If plain HTTP or ProfileNone, use the standard transport
-	if req.URL.Scheme == "http" || t.profile == ProfileNone {
+	if req.URL.Scheme == "http" || activeProfile == ProfileNone {
 		return t.stdTransport.RoundTrip(req)
 	}
 
 	// For HTTPS with a browser profile, use our uTLS engine
-	return t.roundTripBrowserHTTPS(req)
+	return t.roundTripBrowserHTTPS(req, activeProfile)
 }
 
 // roundTripBrowserHTTPS handles HTTPS with uTLS and ALPN negotiation (h2 or http/1.1).
-func (t *CustomTransport) roundTripBrowserHTTPS(req *http.Request) (*http.Response, error) {
+func (t *CustomTransport) roundTripBrowserHTTPS(req *http.Request, activeProfile BrowserProfile) (*http.Response, error) {
 	ctx := req.Context()
 	host := req.URL.Hostname()
 	port := req.URL.Port()
@@ -137,20 +175,26 @@ func (t *CustomTransport) roundTripBrowserHTTPS(req *http.Request) (*http.Respon
 	}
 	targetAddr := net.JoinHostPort(host, port)
 
-	// Check if we have an existing healthy HTTP/2 connection
-	t.h2Mu.RLock()
-	cc, exists := t.h2Conns[targetAddr]
-	t.h2Mu.RUnlock()
+	canPoolH2 := t.proxyPool == nil &&
+		(t.torConfig == nil || !t.torConfig.Enabled || !t.torConfig.StreamIsolation) &&
+		ctx.Value(ctxKeyProfile{}) == nil
 
-	if exists && cc.CanTakeNewRequest() {
-		resp, err := cc.RoundTrip(req)
-		if err == nil {
-			return resp, nil
+	if canPoolH2 {
+		// Check if we have an existing healthy HTTP/2 connection
+		t.h2Mu.RLock()
+		cc, exists := t.h2Conns[targetAddr]
+		t.h2Mu.RUnlock()
+
+		if exists && cc.CanTakeNewRequest() {
+			resp, err := cc.RoundTrip(req)
+			if err == nil {
+				return resp, nil
+			}
+			// If error occurred on pooled conn, remove from cache and proceed to redial
+			t.h2Mu.Lock()
+			delete(t.h2Conns, targetAddr)
+			t.h2Mu.Unlock()
 		}
-		// If error occurred on pooled conn, remove from cache and proceed to redial
-		t.h2Mu.Lock()
-		delete(t.h2Conns, targetAddr)
-		t.h2Mu.Unlock()
 	}
 
 	// Dial TCP / Tor SOCKS5
@@ -165,7 +209,7 @@ func (t *CustomTransport) roundTripBrowserHTTPS(req *http.Request) (*http.Respon
 	}
 
 	// Prepare uTLS config & handshake
-	profConfig := GetProfileConfig(t.profile)
+	profConfig := GetProfileConfig(activeProfile)
 	uConfig := &utls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: t.insecureSkipVerify,
@@ -187,9 +231,11 @@ func (t *CustomTransport) roundTripBrowserHTTPS(req *http.Request) (*http.Respon
 			return nil, fmt.Errorf("failed to initialize h2 connection: %w", err)
 		}
 
-		t.h2Mu.Lock()
-		t.h2Conns[targetAddr] = clientConn
-		t.h2Mu.Unlock()
+		if canPoolH2 {
+			t.h2Mu.Lock()
+			t.h2Conns[targetAddr] = clientConn
+			t.h2Mu.Unlock()
+		}
 
 		return clientConn.RoundTrip(req)
 	}

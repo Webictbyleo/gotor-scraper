@@ -61,9 +61,16 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		}
 	}
 
+	if cfg.profileRotation == RotatePerSession {
+		cfg.profile = GetRandomProfile()
+	}
+
 	transport := NewCustomTransport(cfg.torConfig, cfg.profile, cfg.insecureSkipVerify, cfg.timeout)
 	if cfg.proxyPool != nil {
 		transport.SetProxyPool(cfg.proxyPool)
+	}
+	if cfg.hooks != nil && cfg.hooks.OnProxyRotate != nil {
+		transport.SetOnProxyRotate(cfg.hooks.OnProxyRotate)
 	}
 
 	cli := &http.Client{
@@ -145,7 +152,10 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 	// Apply browser profile headers (with optional per-request rotation)
 	activeProfile := c.cfg.profile
 	if c.cfg.profileRotation == RotatePerRequest {
-		prof := GetRandomProfileConfig()
+		rotProfile := GetRandomProfile()
+		activeProfile = rotProfile
+		req = req.WithContext(withRequestProfile(req.Context(), rotProfile))
+		prof := GetProfileConfig(rotProfile)
 		for k, v := range prof.DefaultHeaders {
 			req.Header.Set(k, v)
 		}
@@ -230,7 +240,10 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 		if ro.torConfig != nil || ro.followRedirects != nil {
 			trans := c.transport
 			if ro.torConfig != nil {
-				trans = NewCustomTransport(ro.torConfig, c.cfg.profile, c.cfg.insecureSkipVerify, c.cfg.timeout)
+				trans = NewCustomTransport(ro.torConfig, activeProfile, c.cfg.insecureSkipVerify, c.cfg.timeout)
+				if c.cfg.hooks != nil && c.cfg.hooks.OnProxyRotate != nil {
+					trans.SetOnProxyRotate(c.cfg.hooks.OnProxyRotate)
+				}
 				defer trans.CloseIdleConnections()
 			}
 			follow := c.cfg.followRedirects
@@ -328,7 +341,11 @@ func (c *Client) Do(req *http.Request, opts ...RequestOption) (*Response, error)
 			if c.cfg.retryCondition != nil {
 				shouldRetry = c.cfg.retryCondition(lastResp, lastErr)
 			} else {
-				if lastErr != nil && !errors.Is(lastErr, ErrContentLengthExceeded) && !errors.Is(lastErr, ErrContentTypeBlocked) && !errors.Is(lastErr, ErrContentTypeNotAllowed) {
+				if lastErr != nil &&
+					!errors.Is(lastErr, ErrContentLengthExceeded) &&
+					!errors.Is(lastErr, ErrContentTypeBlocked) &&
+					!errors.Is(lastErr, ErrContentTypeNotAllowed) &&
+					!errors.Is(lastErr, ErrContentRejected) {
 					shouldRetry = true
 				} else if lastResp != nil && (lastResp.StatusCode == http.StatusTooManyRequests || lastResp.StatusCode >= 500) {
 					shouldRetry = true

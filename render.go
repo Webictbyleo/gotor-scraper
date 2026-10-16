@@ -178,6 +178,10 @@ func (c *Client) buildAllocOpts(rc *RenderConfig) []chromedp.ExecAllocatorOption
 		chromedp.WindowSize(rc.WindowWidth, rc.WindowHeight),
 	)
 
+	if c.cfg.insecureSkipVerify {
+		allocOpts = append(allocOpts, chromedp.Flag("ignore-certificate-errors", true))
+	}
+
 	// Synchronize browser User-Agent with the client's active emulation profile
 	if c.cfg.profile != ProfileNone {
 		prof := GetProfileConfig(c.cfg.profile)
@@ -455,6 +459,19 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		}
 	}
 
+	// Capture live browser URL and cookies after navigation and interactive actions
+	var currentURLStr string
+	var cdpCookies []*network.Cookie
+	_ = chromedp.Do(taskCtx, chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+		if loc, locErr := chromedp.Evaluate[string]("window.location.href")(ctx, t); locErr == nil && loc != "" {
+			currentURLStr = loc
+		}
+		if ckRes, ckErr := cdp.Call(ctx, t, network.GetCookies, network.GetCookiesParams{}); ckErr == nil {
+			cdpCookies = ckRes.Cookies
+		}
+		return nil
+	}))
+
 	// Extract the live, hydrated, modified DOM HTML
 	renderedHTML, err := chromedp.Run(taskCtx, chromedp.OuterHTML("html"))
 	if err != nil {
@@ -471,9 +488,6 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 	// Stage 2 Content Check: Safety Size Limits & Magic-Byte Verification
 	// -------------------------------------------------------------------------
 	maxLimit := c.cfg.maxContentLength
-	if maxLimit <= 0 {
-		maxLimit = DefaultMaxContentLength
-	}
 	if maxLimit > 0 && int64(len(bodyBytes)) > maxLimit {
 		if c.cfg.hooks != nil && c.cfg.hooks.OnError != nil {
 			c.cfg.hooks.OnError(req, ErrContentLengthExceeded, 1)
@@ -503,8 +517,36 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 			}
 		}
 	}
+	if currentURLStr != "" {
+		if u, uErr := url.Parse(currentURLStr); uErr == nil {
+			finalURL = u
+		}
+	}
 	if rawHeader.Get("Content-Type") == "" {
 		rawHeader.Set("Content-Type", "text/html; charset=utf-8")
+	}
+
+	var extractedCookies []*http.Cookie
+	for _, ck := range cdpCookies {
+		if ck == nil {
+			continue
+		}
+		hc := &http.Cookie{
+			Name:     ck.Name,
+			Value:    ck.Value,
+			Domain:   ck.Domain,
+			Path:     ck.Path,
+			HttpOnly: ck.HTTPOnly,
+			Secure:   ck.Secure,
+		}
+		if ck.Expires > 0 {
+			hc.Expires = time.Unix(int64(ck.Expires), 0)
+		}
+		extractedCookies = append(extractedCookies, hc)
+	}
+	if len(extractedCookies) > 0 && c.cfg.cookieJar != nil && finalURL != nil {
+		c.cfg.cookieJar.SetCookies(finalURL, extractedCookies)
+		_ = c.SaveSession()
 	}
 
 	rawResp := &http.Response{
@@ -568,6 +610,7 @@ func (c *Client) GetRendered(ctx context.Context, targetURL string, opts ...Rend
 		StatusCode:  statusCode,
 		Status:      statusText,
 		Headers:     rawHeader,
+		Cookies:     extractedCookies,
 		RawResponse: rawResp,
 		ContentInfo: contentInfo,
 		rawBody:     bodyBytes,

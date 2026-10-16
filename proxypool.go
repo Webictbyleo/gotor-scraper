@@ -1,12 +1,14 @@
 package torscraper
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -179,6 +181,7 @@ func (pp *ProxyPool) DialerForNode(ctx context.Context, node *ProxyNode, timeout
 		KeepAlive: 30 * time.Second,
 	}
 
+	var baseDialer proxy.ContextDialer
 	scheme := strings.ToLower(node.ParsedURL.Scheme)
 	switch scheme {
 	case "socks5", "socks5h":
@@ -201,18 +204,49 @@ func (pp *ProxyPool) DialerForNode(ctx context.Context, node *ProxyNode, timeout
 		if !ok {
 			return nil, errors.New("socks5 dialer does not implement proxy.ContextDialer")
 		}
-		return cDialer, nil
+		baseDialer = cDialer
 
 	case "http", "https":
 		// HTTP CONNECT tunnel dialer
-		return &httpConnectDialer{
+		baseDialer = &httpConnectDialer{
 			proxyURL: node.ParsedURL,
 			forward:  forward,
-		}, nil
+		}
 
 	default:
 		return nil, fmt.Errorf("unsupported proxy protocol: %s", scheme)
 	}
+
+	return &nodeHealthDialer{
+		base: baseDialer,
+		node: node,
+		pool: pp,
+	}, nil
+}
+
+// nodeHealthDialer wraps a proxy.ContextDialer and automatically updates node health on dial results.
+type nodeHealthDialer struct {
+	base proxy.ContextDialer
+	node *ProxyNode
+	pool *ProxyPool
+}
+
+func (d *nodeHealthDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := d.base.DialContext(ctx, network, addr)
+	if err != nil {
+		if d.pool != nil && d.node != nil {
+			d.pool.mu.RLock()
+			cooldown := d.pool.cooldown
+			maxFailures := d.pool.maxFailures
+			d.pool.mu.RUnlock()
+			d.node.RecordFailure(cooldown, maxFailures)
+		}
+		return nil, err
+	}
+	if d.node != nil {
+		d.node.RecordSuccess()
+	}
+	return conn, nil
 }
 
 // httpConnectDialer implements proxy.ContextDialer for HTTP CONNECT tunneling.
@@ -228,11 +262,25 @@ func (h *httpConnectDialer) DialContext(ctx context.Context, network, addr strin
 		return nil, fmt.Errorf("failed to connect to http proxy %s: %w", h.proxyURL.Host, err)
 	}
 
+	// Enforce deadline during CONNECT handshake
+	deadline := time.Now().Add(30 * time.Second)
+	if h.forward != nil && h.forward.Timeout > 0 {
+		deadline = time.Now().Add(h.forward.Timeout)
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	defer func() {
+		_ = conn.SetDeadline(time.Time{})
+	}()
+
 	// Issue HTTP CONNECT request
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
 	if h.proxyURL.User != nil {
-		auth := h.proxyURL.User.String()
-		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", basicAuth(auth))
+		user := h.proxyURL.User.Username()
+		pass, _ := h.proxyURL.User.Password()
+		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", basicAuth(user+":"+pass))
 	}
 	connectReq += "\r\n"
 
@@ -241,18 +289,16 @@ func (h *httpConnectDialer) DialContext(ctx context.Context, network, addr strin
 		return nil, fmt.Errorf("failed to send CONNECT to proxy: %w", err)
 	}
 
-	// Read CONNECT response header
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	// Read and parse HTTP CONNECT response
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to read CONNECT response: %w", err)
 	}
-
-	respStr := string(buf[:n])
-	if !strings.Contains(respStr, "200") {
+	if resp.StatusCode != http.StatusOK {
 		conn.Close()
-		return nil, fmt.Errorf("proxy rejected CONNECT request: %s", strings.TrimSpace(respStr))
+		return nil, fmt.Errorf("proxy rejected CONNECT request: %s", resp.Status)
 	}
 
 	return conn, nil

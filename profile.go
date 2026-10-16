@@ -131,8 +131,13 @@ var activeRotationProfiles = []BrowserProfile{
 	ProfileEdge,
 }
 
+// GetRandomProfile returns a randomly selected synchronized BrowserProfile.
+func GetRandomProfile() BrowserProfile {
+	return activeRotationProfiles[rand.Intn(len(activeRotationProfiles))]
+}
+
 // GetRandomProfileConfig returns a randomly selected synchronized browser profile.
 func GetRandomProfileConfig() ProfileConfig {
-	profile := activeRotationProfiles[rand.Intn(len(activeRotationProfiles))]
-	return GetProfileConfig(profile)
+	return GetProfileConfig(GetRandomProfile())
 }
+
