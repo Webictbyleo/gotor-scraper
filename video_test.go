@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -949,4 +950,50 @@ func TestDownloadAllVideos_Mock(t *testing.T) {
 		t.Fatalf("DownloadAllVideos failed: %v", err)
 	}
 	_ = results
+}
+
+func TestDownloadSizeLimits_Mock(t *testing.T) {
+	hugePayload := bytes.Repeat([]byte("A"), 1024*1024) // 1MB payload
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(hugePayload)))
+		w.Write(hugePayload)
+	}))
+	defer ts.Close()
+
+	client, err := NewClient()
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	stream := VideoStream{
+		Platform: PlatformVimeo,
+		VideoID:  "12345",
+		URL:      ts.URL + "/stream.mp4",
+		Size:     int64(len(hugePayload)),
+	}
+
+	ctx := context.Background()
+
+	// 1. Test MaxFileSize rejection before/at Content-Length check
+	var buf bytes.Buffer
+	_, err = client.downloadStreamInternal(ctx, stream, &buf, 0, 500*1024, nil) // Limit to 500KB
+	if err == nil || !errors.Is(err, ErrContentLengthExceeded) {
+		t.Errorf("expected ErrContentLengthExceeded when size exceeds MaxFileSize, got: %v", err)
+	}
+
+	// 2. Test MaxBytes capping (e.g. read only 128KB of the 1MB file)
+	buf.Reset()
+	n, err := client.downloadStreamInternal(ctx, stream, &buf, 128*1024, 0, nil)
+	if err != nil {
+		t.Fatalf("download with MaxBytes failed: %v", err)
+	}
+	if n != 128*1024 {
+		t.Errorf("expected exactly 128KB (131072 bytes), got %d bytes", n)
+	}
+	if buf.Len() != 128*1024 {
+		t.Errorf("expected buffer to hold 128KB, got %d", buf.Len())
+	}
 }

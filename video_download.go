@@ -84,8 +84,14 @@ type DownloadOptions struct {
 	// AllowYtDlp allows falling back to the external yt-dlp binary if available on the system PATH.
 	AllowYtDlp bool
 
-	// MaxBytes limits the maximum downloaded bytes (0 = unlimited). Useful for previews and testing.
+	// MaxBytes limits the maximum downloaded bytes to transfer (0 = unlimited).
+	// The stream stops reading once this count is reached. Useful for previews, clips, or bandwidth caps.
 	MaxBytes int64
+
+	// MaxFileSize specifies the maximum allowable video size in bytes (0 = unlimited).
+	// If the video's declared size or server Content-Length exceeds this limit, DownloadVideo
+	// aborts immediately and returns ErrContentLengthExceeded before downloading data.
+	MaxFileSize int64
 }
 
 // DownloadResult summarizes a successfully completed video download.
@@ -202,6 +208,11 @@ func (c *Client) DownloadVideo(ctx context.Context, target any, opts DownloadOpt
 	// Select best matching stream
 	selectedStream := selectBestStream(streams, opts.Quality, opts.Container)
 
+	// Preflight check against declared stream size from metadata
+	if opts.MaxFileSize > 0 && selectedStream.Size > 0 && selectedStream.Size > opts.MaxFileSize {
+		return nil, fmt.Errorf("%w: declared video size %d bytes exceeds MaxFileSize %d bytes", ErrContentLengthExceeded, selectedStream.Size, opts.MaxFileSize)
+	}
+
 	var destWriter io.Writer
 	var targetFile *os.File
 
@@ -224,7 +235,7 @@ func (c *Client) DownloadVideo(ctx context.Context, target any, opts DownloadOpt
 		destWriter = opts.Writer
 	}
 
-	bytesWritten, err := c.DownloadStreamLimit(ctx, selectedStream, destWriter, opts.MaxBytes, opts.OnProgress)
+	bytesWritten, err := c.downloadStreamInternal(ctx, selectedStream, destWriter, opts.MaxBytes, opts.MaxFileSize, opts.OnProgress)
 	if err != nil {
 		if targetFile != nil {
 			_ = os.Remove(opts.OutputPath) // Clean up partial file on failure
@@ -244,11 +255,16 @@ func (c *Client) DownloadVideo(ctx context.Context, target any, opts DownloadOpt
 
 // DownloadStream streams the content of a specific VideoStream directly to destination io.Writer.
 func (c *Client) DownloadStream(ctx context.Context, stream VideoStream, w io.Writer, onProgress DownloadProgressFn) (int64, error) {
-	return c.DownloadStreamLimit(ctx, stream, w, 0, onProgress)
+	return c.downloadStreamInternal(ctx, stream, w, 0, 0, onProgress)
 }
 
 // DownloadStreamLimit streams up to maxBytes of a VideoStream to destination io.Writer (maxBytes <= 0 for unlimited).
 func (c *Client) DownloadStreamLimit(ctx context.Context, stream VideoStream, w io.Writer, maxBytes int64, onProgress DownloadProgressFn) (int64, error) {
+	return c.downloadStreamInternal(ctx, stream, w, maxBytes, 0, onProgress)
+}
+
+// downloadStreamInternal handles HTTP fetching, headers, size checks, and streaming to destination writer.
+func (c *Client) downloadStreamInternal(ctx context.Context, stream VideoStream, w io.Writer, maxBytes, maxFileSize int64, onProgress DownloadProgressFn) (int64, error) {
 	if stream.URL == "" {
 		return 0, fmt.Errorf("video stream URL is empty")
 	}
@@ -281,6 +297,12 @@ func (c *Client) DownloadStreamLimit(ctx context.Context, stream VideoStream, w 
 	if totalSize <= 0 && stream.Size > 0 {
 		totalSize = stream.Size
 	}
+
+	// Preflight check against HTTP Content-Length header
+	if maxFileSize > 0 && totalSize > 0 && totalSize > maxFileSize {
+		return 0, fmt.Errorf("%w: declared video size %d bytes exceeds MaxFileSize %d bytes", ErrContentLengthExceeded, totalSize, maxFileSize)
+	}
+
 	if maxBytes > 0 && (totalSize <= 0 || maxBytes < totalSize) {
 		totalSize = maxBytes
 	}

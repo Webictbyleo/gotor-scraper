@@ -581,7 +581,8 @@ fmt.Printf("\nSaved %d bytes in %v to %s\n", result.BytesWritten, result.Duratio
 | `OutputPath` | `string` | Local file path destination. Directories are created automatically. |
 | `Writer` | `io.Writer` | Custom stream destination (for piping to in-memory buffers, cloud storage, or HTTP responses). |
 | `OnProgress` | `func(downloaded, total, pct)` | Real-time byte transfer progress callback. |
-| `MaxBytes` | `int64` | Maximum bytes to download (`0` = unlimited). Ideal for video previews or header checks. |
+| `MaxBytes` | `int64` | Maximum bytes to transfer (`0` = unlimited). Stops reading once reached (ideal for previews or bandwidth caps). |
+| `MaxFileSize` | `int64` | Maximum allowed video size in bytes (`0` = unlimited). Aborts immediately with `ErrContentLengthExceeded` if declared size exceeds this limit before downloading. |
 | `AllowYtDlp` | `bool` | Enables automatic fallback to `yt-dlp` if installed on PATH for complex/4K YouTube ciphered streams. |
 
 ---
