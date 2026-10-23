@@ -45,36 +45,86 @@ var (
 
 // VideoInfo holds structured information parsed from a video URL or embed.
 type VideoInfo struct {
-	Platform      VideoPlatform     `json:"platform"`
-	ID            string            `json:"id"`
-	Type          VideoType         `json:"type"`
-	OriginalURL   string            `json:"original_url"`
-	CanonicalURL  string            `json:"canonical_url"`
-	EmbedURL      string            `json:"embed_url"`
-	ThumbnailURL  string            `json:"thumbnail_url,omitempty"`
+	// Platform identifies the hosting provider (PlatformYouTube, PlatformLoom, PlatformVimeo, PlatformWistia).
+	Platform VideoPlatform `json:"platform"`
+
+	// ID is the unique alphanumeric or numeric identifier of the video.
+	ID string `json:"id"`
+
+	// Type categorizes the format of the link (Standard, Shorts, Live, Playlist, Clip, Embed).
+	Type VideoType `json:"type"`
+
+	// OriginalURL is the raw unmodified URL passed to the parser.
+	OriginalURL string `json:"original_url"`
+
+	// CanonicalURL is the standardized, canonical watch/share URL for the video.
+	CanonicalURL string `json:"canonical_url"`
+
+	// EmbedURL is the standardized iframe embed player URL.
+	EmbedURL string `json:"embed_url"`
+
+	// ThumbnailURL is the primary high-resolution poster or thumbnail image URL.
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+
+	// ThumbnailURLs maps available resolution quality keys (e.g. "default", "hqdefault", "maxresdefault", "poster") to URLs.
 	ThumbnailURLs map[string]string `json:"thumbnail_urls,omitempty"`
-	Timestamp     time.Duration     `json:"timestamp,omitempty"`
-	TimestampSec  int               `json:"timestamp_sec,omitempty"`
-	PlaylistID    string            `json:"playlist_id,omitempty"`
-	Account       string            `json:"account,omitempty"`
-	PrivacyHash   string            `json:"privacy_hash,omitempty"`
-	Params        map[string]string `json:"params,omitempty"`
-	Element       *HTMLElement      `json:"-"`
+
+	// Timestamp is the parsed starting playback offset duration (e.g. 1m30s).
+	Timestamp time.Duration `json:"timestamp,omitempty"`
+
+	// TimestampSec is the starting playback offset expressed in integer seconds.
+	TimestampSec int `json:"timestamp_sec,omitempty"`
+
+	// PlaylistID is the associated playlist identifier, if present in the link.
+	PlaylistID string `json:"playlist_id,omitempty"`
+
+	// Account is the user, channel, or workspace account identifier, if present.
+	Account string `json:"account,omitempty"`
+
+	// PrivacyHash is the unlisted/secret security hash (e.g. Vimeo unlisted hash "h").
+	PrivacyHash string `json:"privacy_hash,omitempty"`
+
+	// Params contains all raw query parameters parsed from the original URL.
+	Params map[string]string `json:"params,omitempty"`
+
+	// Element is the underlying HTMLElement if this video was extracted from an HTML DOM tree.
+	Element *HTMLElement `json:"-"`
 }
 
 // VideoMetadata represents oEmbed metadata retrieved from the video provider.
 type VideoMetadata struct {
-	Platform     VideoPlatform `json:"platform"`
-	VideoID      string        `json:"video_id"`
-	Title        string        `json:"title"`
-	AuthorName   string        `json:"author_name"`
-	AuthorURL    string        `json:"author_url"`
-	ThumbnailURL string        `json:"thumbnail_url"`
-	HTML         string        `json:"html"`
-	Width        int           `json:"width"`
-	Height       int           `json:"height"`
-	Duration     time.Duration `json:"duration,omitempty"`
-	Description  string        `json:"description,omitempty"`
+	// Platform identifies the hosting provider.
+	Platform VideoPlatform `json:"platform"`
+
+	// VideoID is the unique video identifier.
+	VideoID string `json:"video_id"`
+
+	// Title is the official title of the video.
+	Title string `json:"title"`
+
+	// AuthorName is the creator or channel name.
+	AuthorName string `json:"author_name"`
+
+	// AuthorURL is the profile URL of the creator or channel.
+	AuthorURL string `json:"author_url"`
+
+	// ThumbnailURL is the thumbnail image URL provided in oEmbed data.
+	ThumbnailURL string `json:"thumbnail_url"`
+
+	// HTML is the official responsive iframe embed code snippet.
+	HTML string `json:"html"`
+
+	// Width is the intrinsic video display width in pixels.
+	Width int `json:"width"`
+
+	// Height is the intrinsic video display height in pixels.
+	Height int `json:"height"`
+
+	// Duration is the video duration, if reported by the provider.
+	Duration time.Duration `json:"duration,omitempty"`
+
+	// Description is the text summary or description of the video, if available.
+	Description string `json:"description,omitempty"`
 }
 
 var (

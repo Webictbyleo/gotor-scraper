@@ -490,52 +490,76 @@ if err := torCtrl.NewIdentity(ctx); err != nil {
 
 `gotor-scraper` provides built-in utilities to identify, normalize, extract, and download video assets from **YouTube**, **Loom**, **Vimeo**, and **Wistia**.
 
+You can pass video URLs **directly** (e.g. `https://youtu.be/...`, `https://www.loom.com/share/...`, `https://vimeo.com/...`, `https://fast.wistia.net/embed/iframe/...`) or harvest them automatically from third-party scraped webpages.
+
 #### 1. Universal URL Parsing
 
 ```go
+// Works with shortlinks, timestamps, watch URLs, embed links, and unlisted hashes
 video, err := torscraper.ParseVideoURL("https://youtu.be/dQw4w9WgXcQ?t=1m30s")
 if err != nil {
     panic(err)
 }
 
-fmt.Println("Platform:", video.Platform)       // "youtube"
-fmt.Println("Video ID:", video.ID)             // "dQw4w9WgXcQ"
+fmt.Println("Platform:", video.Platform)          // "youtube"
+fmt.Println("Video ID:", video.ID)                // "dQw4w9WgXcQ"
 fmt.Println("Canonical URL:", video.CanonicalURL) // "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 fmt.Println("Embed URL:", video.EmbedURL)         // "https://www.youtube.com/embed/dQw4w9WgXcQ?start=90"
-fmt.Println("Start Offset:", video.Timestamp)     // 90s
-fmt.Println("Thumbnail URL:", video.ThumbnailURL) // "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+fmt.Println("Start Offset:", video.Timestamp)     // 1m30s
+fmt.Println("Thumbnail URL:", video.ThumbnailURL) // High-res poster image
 ```
 
-#### 2. HTML Video Extraction
+#### 2. Live Metadata & oEmbed Extraction
 
-Effortlessly extract all embedded videos and links from any scraped page:
+Retrieve official title, author profile, duration, dimensions, and responsive embed HTML:
+
+```go
+meta, err := client.FetchVideoMetadata(ctx, "https://fast.wistia.net/embed/iframe/26sk4lmiix")
+if err != nil {
+    log.Fatalf("Metadata fetch failed: %v", err)
+}
+
+fmt.Println("Title:", meta.Title)
+fmt.Println("Author:", meta.AuthorName)
+fmt.Println("Duration:", meta.Duration)
+fmt.Println("Dimensions:", meta.Width, "x", meta.Height)
+```
+
+#### 3. HTML Page Video Harvesting
+
+Scrape any blog, news site, or documentation page and discover all embedded videos:
 
 ```go
 resp, err := client.Get(ctx, "https://example.com/blog/video-guide")
 doc, err := resp.HTML()
 
-// Automatically detects iframes, embeds, links, and Wistia async containers
+// Automatically detects iframes, embeds, links, and Wistia async containers (with zero video download overhead)
 videos := doc.Videos()
 for _, v := range videos {
     fmt.Printf("[%s] ID=%s Embed=%s\n", v.Platform, v.ID, v.EmbedURL)
 }
+
+// Or batch-download all discovered videos to a local directory:
+results, err := doc.DownloadAllVideos(ctx, client, "./downloads", torscraper.DownloadOptions{
+    Quality: "best",
+})
 ```
 
-#### 3. Extracting Streams & Downloading Videos
+#### 4. Extracting Streams & Downloading Videos
 
-Query available direct streams and stream-download the highest quality MP4 directly to disk with live progress:
+Query available direct media assets and stream-download directly to disk or to an `io.Writer` with real-time progress tracking:
 
 ```go
-// 1. Extract direct downloadable streams
-streams, err := client.ExtractVideoStreams(ctx, "https://fast.wistia.net/embed/iframe/g5pnf59ala")
+// 1. Extract direct downloadable streams (resolutions, bitrates, containers, sizes)
+streams, err := client.ExtractVideoStreams(ctx, "https://www.loom.com/share/ea2fff85aaaf4314af3cf72cffcd113a")
 for _, s := range streams {
     fmt.Printf("Quality: %s (%dx%d), Container: %s, Bitrate: %d\n",
         s.Quality, s.Width, s.Height, s.Container, s.Bitrate)
 }
 
 // 2. Download the best quality stream with real-time progress tracking
-result, err := client.DownloadVideo(ctx, "https://fast.wistia.net/embed/iframe/g5pnf59ala", torscraper.DownloadOptions{
-    Quality:    "best",
+result, err := client.DownloadVideo(ctx, "https://fast.wistia.net/embed/iframe/26sk4lmiix", torscraper.DownloadOptions{
+    Quality:    "best",               // "best", "1080p", "720p", "360p", or "worst"
     OutputPath: "./downloads/video.mp4",
     OnProgress: func(downloaded, total int64, pct float64) {
         fmt.Printf("\rDownloading: %.1f%% (%d / %d bytes)", pct, downloaded, total)
@@ -547,6 +571,18 @@ if err != nil {
 
 fmt.Printf("\nSaved %d bytes in %v to %s\n", result.BytesWritten, result.Duration, result.OutputPath)
 ```
+
+#### Download Options Reference
+
+| Option | Type | Description |
+|---|---|---|
+| `Quality` | `string` | Target quality resolution: `"best"` (default), `"worst"`, `"1080p"`, `"720p"`, `"480p"`, `"360p"`. |
+| `Container` | `string` | Format container filter: `"mp4"`, `"webm"`. |
+| `OutputPath` | `string` | Local file path destination. Directories are created automatically. |
+| `Writer` | `io.Writer` | Custom stream destination (for piping to in-memory buffers, cloud storage, or HTTP responses). |
+| `OnProgress` | `func(downloaded, total, pct)` | Real-time byte transfer progress callback. |
+| `MaxBytes` | `int64` | Maximum bytes to download (`0` = unlimited). Ideal for video previews or header checks. |
+| `AllowYtDlp` | `bool` | Enables automatic fallback to `yt-dlp` if installed on PATH for complex/4K YouTube ciphered streams. |
 
 ---
 

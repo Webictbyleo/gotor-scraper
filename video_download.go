@@ -20,18 +20,41 @@ import (
 
 // VideoStream represents a directly downloadable media stream or asset.
 type VideoStream struct {
-	Platform  VideoPlatform `json:"platform"`
-	VideoID   string        `json:"video_id"`
-	URL       string        `json:"url"`
-	Quality   string        `json:"quality"`   // e.g. "1080p", "720p", "480p", "360p", "original"
-	Width     int           `json:"width"`
-	Height    int           `json:"height"`
-	Bitrate   int64         `json:"bitrate"`   // Bits per second
-	Size      int64         `json:"size"`      // Size in bytes (-1 if unknown)
-	MimeType  string        `json:"mime_type"` // e.g. "video/mp4", "video/webm"
-	Container string        `json:"container"` // "mp4", "webm", "m3u8"
-	IsMuxed   bool          `json:"is_muxed"`  // Contains both audio and video
-	FPS       int           `json:"fps,omitempty"`
+	// Platform identifies the hosting video service (PlatformYouTube, PlatformLoom, PlatformVimeo, PlatformWistia).
+	Platform VideoPlatform `json:"platform"`
+
+	// VideoID is the unique identifier of the video.
+	VideoID string `json:"video_id"`
+
+	// URL is the direct playable/downloadable CDN media link.
+	URL string `json:"url"`
+
+	// Quality indicates the resolution tier or quality label (e.g. "1080p", "720p", "480p", "360p", "original").
+	Quality string `json:"quality"`
+
+	// Width is the video frame width in pixels.
+	Width int `json:"width"`
+
+	// Height is the video frame height in pixels.
+	Height int `json:"height"`
+
+	// Bitrate is the average bitrate in bits per second.
+	Bitrate int64 `json:"bitrate"`
+
+	// Size is the declared media file length in bytes (-1 if chunked or unknown).
+	Size int64 `json:"size"`
+
+	// MimeType is the media MIME type (e.g. "video/mp4", "video/webm", "application/x-mpegURL").
+	MimeType string `json:"mime_type"`
+
+	// Container is the format container type ("mp4", "webm", "m3u8").
+	Container string `json:"container"`
+
+	// IsMuxed is true if the stream contains both video and audio tracks combined in a single file.
+	IsMuxed bool `json:"is_muxed"`
+
+	// FPS is the frames per second, if reported.
+	FPS int `json:"fps,omitempty"`
 }
 
 // DownloadProgressFn is called during downloading with progress statistics.
@@ -67,12 +90,23 @@ type DownloadOptions struct {
 
 // DownloadResult summarizes a successfully completed video download.
 type DownloadResult struct {
-	Platform     VideoPlatform
-	VideoID      string
-	Stream       VideoStream
-	OutputPath   string
+	// Platform is the video hosting provider.
+	Platform VideoPlatform
+
+	// VideoID is the unique identifier of the downloaded video.
+	VideoID string
+
+	// Stream is the exact media stream asset that was downloaded.
+	Stream VideoStream
+
+	// OutputPath is the file path on disk where the file was written (empty if streaming to io.Writer).
+	OutputPath string
+
+	// BytesWritten is the total number of bytes successfully written.
 	BytesWritten int64
-	Duration     time.Duration
+
+	// Duration is the total time elapsed during the download process.
+	Duration time.Duration
 }
 
 // progressTrackingWriter wraps an io.Writer to report byte counts.
