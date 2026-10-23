@@ -2,8 +2,10 @@ package torscraper
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -208,6 +210,64 @@ func (doc *HTMLDocument) Images() []string {
 		images = append(images, el.AbsoluteURL("src"))
 	}
 	return images
+}
+
+// Videos extracts all embedded or linked YouTube, Loom, Vimeo, and Wistia videos from the document.
+// Resolves relative URLs to absolute URLs and deduplicates items while preserving page order.
+func (doc *HTMLDocument) Videos() []*VideoInfo {
+	if doc == nil || doc.root == nil {
+		return nil
+	}
+	return extractVideosFromDOM(doc.root, doc.finalURL)
+}
+
+// VideoURLs extracts all unique canonical video URLs found within the document.
+func (doc *HTMLDocument) VideoURLs() []string {
+	videos := doc.Videos()
+	if len(videos) == 0 {
+		return nil
+	}
+	urls := make([]string, len(videos))
+	for i, v := range videos {
+		urls[i] = v.CanonicalURL
+	}
+	return urls
+}
+
+// DownloadAllVideos automatically downloads all videos discovered in the document to outputDir.
+// Each video file is saved as "{platform}_{id}.mp4" inside outputDir (unless OutputPath is set in opts).
+func (doc *HTMLDocument) DownloadAllVideos(ctx context.Context, client *Client, outputDir string, opts DownloadOptions) ([]*DownloadResult, error) {
+	if doc == nil || client == nil {
+		return nil, nil
+	}
+
+	videos := doc.Videos()
+	if len(videos) == 0 {
+		return nil, nil
+	}
+
+	var results []*DownloadResult
+	for _, v := range videos {
+		itemOpts := opts
+		if itemOpts.OutputPath == "" && outputDir != "" {
+			itemOpts.OutputPath = filepath.Join(outputDir, fmt.Sprintf("%s_%s.mp4", v.Platform, v.ID))
+		}
+		res, err := client.DownloadVideo(ctx, v, itemOpts)
+		if err != nil {
+			// Continue downloading remaining videos if one fails
+			continue
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+// Videos extracts all embedded or linked YouTube, Loom, Vimeo, and Wistia videos within this element's subtree.
+func (el *HTMLElement) Videos() []*VideoInfo {
+	if el == nil || el.node == nil {
+		return nil
+	}
+	return extractVideosFromDOM(el.node, el.finalURL)
 }
 
 // Attr returns the value of an attribute on this element, or an empty string if not found.
@@ -509,4 +569,114 @@ func cleanResultText(s string) string {
 	}
 
 	return strings.TrimSpace(strings.Join(cleaned, "\n"))
+}
+
+var reWistiaAsyncClass = regexp.MustCompile(`(?:^|\s)wistia_async_([a-zA-Z0-9]+)(?:$|\s)`)
+
+// extractVideosFromDOM traverses the HTML AST and extracts embedded and linked video resources.
+func extractVideosFromDOM(root *html.Node, finalURL *url.URL) []*VideoInfo {
+	if root == nil {
+		return nil
+	}
+
+	var videos []*VideoInfo
+	seen := make(map[string]bool)
+
+	addVideo := func(rawTarget string, n *html.Node) {
+		rawTarget = strings.TrimSpace(rawTarget)
+		if rawTarget == "" {
+			return
+		}
+
+		absURL := rawTarget
+		if finalURL != nil {
+			if ref, err := url.Parse(rawTarget); err == nil {
+				absURL = finalURL.ResolveReference(ref).String()
+			}
+		}
+
+		if !IsVideoURL(absURL) {
+			return
+		}
+
+		info, err := ParseVideoURL(absURL)
+		if err != nil || info == nil {
+			return
+		}
+
+		key := string(info.Platform) + ":" + info.ID
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+
+		if n != nil {
+			info.Element = &HTMLElement{node: n, finalURL: finalURL}
+		}
+		videos = append(videos, info)
+	}
+
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if n == nil {
+			return
+		}
+
+		if n.Type == html.ElementNode {
+			tag := strings.ToLower(n.Data)
+
+			switch tag {
+			case "iframe", "embed":
+				for _, a := range n.Attr {
+					if strings.ToLower(a.Key) == "src" {
+						addVideo(a.Val, n)
+					}
+				}
+			case "video", "source":
+				for _, a := range n.Attr {
+					if strings.ToLower(a.Key) == "src" {
+						addVideo(a.Val, n)
+					}
+				}
+			case "a":
+				for _, a := range n.Attr {
+					if strings.ToLower(a.Key) == "href" {
+						addVideo(a.Val, n)
+					}
+				}
+			case "script":
+				for _, a := range n.Attr {
+					if strings.ToLower(a.Key) == "src" {
+						val := a.Val
+						if strings.Contains(val, "wistia.com/embed/medias/") || strings.Contains(val, "wistia.net/embed/medias/") {
+							addVideo(val, n)
+						}
+					}
+				}
+			}
+
+			// Check Wistia embed containers (e.g. <div class="wistia_embed wistia_async_g5pnf59ala">)
+			for _, a := range n.Attr {
+				k := strings.ToLower(a.Key)
+				if k == "class" {
+					if matches := reWistiaAsyncClass.FindStringSubmatch(a.Val); len(matches) > 1 {
+						wistiaURL := "https://fast.wistia.net/embed/iframe/" + matches[1]
+						addVideo(wistiaURL, n)
+					}
+				} else if k == "data-wistia-id" {
+					if a.Val != "" {
+						wistiaURL := "https://fast.wistia.net/embed/iframe/" + a.Val
+						addVideo(wistiaURL, n)
+					}
+				}
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+
+	walk(root)
+	return videos
 }

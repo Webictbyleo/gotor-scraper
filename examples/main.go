@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Webictbyleo/gotor-scraper"
@@ -56,7 +57,7 @@ func main() {
 		torscraper.WithTor(&torscraper.TorConfig{
 			Enabled:         true,
 			ProxyAddr:       torscraper.DefaultTorSOCKSAddr, // "127.0.0.1:9050"
-			StreamIsolation: true,                        // Auto-assigns distinct circuits concurrently!
+			StreamIsolation: true,                          // Auto-assigns distinct circuits concurrently!
 		}),
 		torscraper.WithBrowserProfile(torscraper.ProfileChrome),
 		torscraper.WithTimeout(25*time.Second),
@@ -176,6 +177,28 @@ func main() {
 		renderedDoc, _ := renderedResp.HTML()
 		fmt.Printf("-> Fully Rendered Title: %s (Status: %d)\n", renderedDoc.Title(), renderedResp.StatusCode)
 	}
+
+	// -------------------------------------------------------------------------
+	// 8. Video URL Handling, Extraction & Downloader Engine
+	// -------------------------------------------------------------------------
+	fmt.Println("\n[8] Demonstrating Video URL Handling, Extraction & Downloader Engine...")
+
+	sampleVideoURLs := []string{
+		"https://youtu.be/dQw4w9WgXcQ?t=1m30s",
+		"https://www.loom.com/share/d4a3479a9eb74b34b1220a2e379b3ee9?t=15s",
+		"https://vimeo.com/76979871/d3506a2e4b",
+		"https://fast.wistia.net/embed/iframe/g5pnf59ala",
+	}
+
+	for _, vURL := range sampleVideoURLs {
+		video, err := torscraper.ParseVideoURL(vURL)
+		if err == nil {
+			fmt.Printf("-> [%s] ID: %s | Embed: %s (Timestamp: %v)\n",
+				strings.ToUpper(string(video.Platform)), video.ID, video.EmbedURL, video.Timestamp)
+		}
+	}
+
+	fmt.Println("-> Video extraction via doc.Videos() effortlessly extracts and deduplicates embeds from iframes, links, and Wistia containers.")
 
 	fmt.Println("\n=================================================================")
 	fmt.Println("All scraper capabilities demonstrated successfully.")

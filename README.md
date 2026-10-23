@@ -24,6 +24,11 @@ A modular, high-concurrency Go scraping module designed with an **`aiohttp`**-st
   - Multi-worker dispatcher (analogous to Python's `asyncio.gather` + `asyncio.Semaphore`).
   - Token bucket rate limiter (`golang.org/x/time/rate`).
   - Exponential backoff retries with optional circuit rotation on failure.
+- **Universal Video Handling & Downloader Engine**:
+  - Full support for **YouTube**, **Loom**, **Vimeo**, and **Wistia**.
+  - URL identification, parsing, timestamp normalization, and embed/canonical/thumbnail generation.
+  - Page-level video harvesting (`doc.Videos()`) across `<iframe>`, `<embed>`, `<video>`, `<source>`, `<a>`, and Wistia async DOM containers.
+  - Media stream extraction (`client.ExtractVideoStreams`) and streaming downloader (`client.DownloadVideo`) with live progress callbacks (`OnProgress`).
 
 ---
 
@@ -477,6 +482,70 @@ torCtrl := torscraper.NewTorController("127.0.0.1:9051", "optional_password")
 if err := torCtrl.NewIdentity(ctx); err != nil {
     log.Printf("Failed to rotate Tor identity: %v", err)
 }
+```
+
+---
+
+### 15. Video URL Parsing, HTML Extraction & Stream Downloader (YouTube, Loom, Vimeo, Wistia)
+
+`gotor-scraper` provides built-in utilities to identify, normalize, extract, and download video assets from **YouTube**, **Loom**, **Vimeo**, and **Wistia**.
+
+#### 1. Universal URL Parsing
+
+```go
+video, err := torscraper.ParseVideoURL("https://youtu.be/dQw4w9WgXcQ?t=1m30s")
+if err != nil {
+    panic(err)
+}
+
+fmt.Println("Platform:", video.Platform)       // "youtube"
+fmt.Println("Video ID:", video.ID)             // "dQw4w9WgXcQ"
+fmt.Println("Canonical URL:", video.CanonicalURL) // "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+fmt.Println("Embed URL:", video.EmbedURL)         // "https://www.youtube.com/embed/dQw4w9WgXcQ?start=90"
+fmt.Println("Start Offset:", video.Timestamp)     // 90s
+fmt.Println("Thumbnail URL:", video.ThumbnailURL) // "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+```
+
+#### 2. HTML Video Extraction
+
+Effortlessly extract all embedded videos and links from any scraped page:
+
+```go
+resp, err := client.Get(ctx, "https://example.com/blog/video-guide")
+doc, err := resp.HTML()
+
+// Automatically detects iframes, embeds, links, and Wistia async containers
+videos := doc.Videos()
+for _, v := range videos {
+    fmt.Printf("[%s] ID=%s Embed=%s\n", v.Platform, v.ID, v.EmbedURL)
+}
+```
+
+#### 3. Extracting Streams & Downloading Videos
+
+Query available direct streams and stream-download the highest quality MP4 directly to disk with live progress:
+
+```go
+// 1. Extract direct downloadable streams
+streams, err := client.ExtractVideoStreams(ctx, "https://fast.wistia.net/embed/iframe/g5pnf59ala")
+for _, s := range streams {
+    fmt.Printf("Quality: %s (%dx%d), Container: %s, Bitrate: %d\n",
+        s.Quality, s.Width, s.Height, s.Container, s.Bitrate)
+}
+
+// 2. Download the best quality stream with real-time progress tracking
+result, err := client.DownloadVideo(ctx, "https://fast.wistia.net/embed/iframe/g5pnf59ala", torscraper.DownloadOptions{
+    Quality:    "best",
+    OutputPath: "./downloads/video.mp4",
+    OnProgress: func(downloaded, total int64, pct float64) {
+        fmt.Printf("\rDownloading: %.1f%% (%d / %d bytes)", pct, downloaded, total)
+    },
+})
+if err != nil {
+    log.Fatalf("Download failed: %v", err)
+}
+
+fmt.Printf("\nSaved %d bytes in %v to %s\n", result.BytesWritten, result.Duration, result.OutputPath)
 ```
 
 ---
